@@ -208,7 +208,7 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
           <div>
             <MessageSquareText className="cyan" size={34} />
             <h3>拖拽或点击导入评论表格</h3>
-            <p className="muted">支持 CSV / Excel，系统将输出 Aspect、Opinion、Sentiment、Reason 四类信息。</p>
+            <p className="muted">支持 TSV / CSV / Excel，系统将输出 Aspect、Opinion、Sentiment、Reason 四类信息。</p>
           </div>
         </label>
       </section>
