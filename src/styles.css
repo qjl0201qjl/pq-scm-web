@@ -330,6 +330,64 @@ select {
   border: 1px solid rgba(251, 191, 36, 0.22);
 }
 
+.input {
+  width: 100%;
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  background: rgba(15, 23, 42, 0.88);
+  color: #e5f4ff;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.llm-config-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.llm-config-grid label {
+  display: grid;
+  gap: 8px;
+}
+
+.llm-actions,
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.progress-wrap {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.progress-bar {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(51, 65, 85, 0.65);
+}
+
+.progress-bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #22d3ee, #34d399);
+  transition: width 0.25s ease;
+}
+
+.progress-stats {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  color: #86a0bf;
+  font-size: 12px;
+}
+
 .sample-preview {
   margin-top: 16px;
   display: grid;
@@ -601,7 +659,8 @@ select {
   .kano-grid,
   .detail-grid,
   .import-grid,
-  .keyword-grid {
+  .keyword-grid,
+  .llm-config-grid {
     grid-template-columns: 1fr;
   }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, ClipboardCheck, FileSpreadsheet, Gauge, Layers3, MessageSquareText, Radio, Share2 } from 'lucide-react';
 import { ConfigProvider, theme } from 'antd';
 import { motion } from 'framer-motion';
@@ -8,8 +8,9 @@ import ReactECharts from './ReactECharts';
 import { extractReviewInsight } from './absa';
 import { engineeringFeatures, problems, qfdRelations, reports, reviews as seedReviews, scmRecommendations, warnings } from './data';
 import { featurePriority, getFdaScore, getKanoCoefficient, getKanoColor, getKanoLabel, getKpis, getPriorityExplanation, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
+import { analyzeWithLlm, defaultLlmConfig, LlmProgress, makeInitialProgress, resultToInsight, ruleInsightFor, shouldUseRuleOnly } from './llmAbsa';
 import { parseReviewFile, rebuildReviewImportResult } from './upload';
-import { KanoCategory, QualityProblem, ReviewImportResult, ReviewRecord, Sentiment } from './types';
+import { AbsaMode, KanoCategory, LlmAbsaConfig, QualityProblem, ReviewImportResult, ReviewInsight, ReviewRecord, Sentiment } from './types';
 
 type PageKey = 'dashboard' | 'reviews' | 'diagnosis' | 'qfd' | 'scm' | 'case' | 'reports';
 
@@ -244,9 +245,16 @@ function keywordStatsByAspect(insights: ReturnType<typeof extractReviewInsight>[
 function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void }) {
   const [model, setModel] = useState('全部车型');
   const [importResult, setImportResult] = useState<ReviewImportResult | null>(null);
+  const [absaMode, setAbsaMode] = useState<AbsaMode>('rule');
+  const [llmConfig, setLlmConfig] = useState<LlmAbsaConfig>(defaultLlmConfig);
+  const [llmProgress, setLlmProgress] = useState<LlmProgress>(makeInitialProgress(0));
+  const [llmInsights, setLlmInsights] = useState<Record<string, ReviewInsight>>({});
+  const [reviewFilter, setReviewFilter] = useState<'all' | 'needReview'>('all');
+  const queueControl = useRef({ paused: false, stopped: false, abort: null as AbortController | null });
   const filtered = reviews.filter((item) => model === '全部车型' || item.model === model);
   const models = ['全部车型', ...Array.from(new Set(reviews.map((item) => item.model)))];
-  const insights = filtered.map(extractReviewInsight);
+  const insights = filtered.map((item) => llmInsights[item.id] || extractReviewInsight(item));
+  const visibleInsights = reviewFilter === 'needReview' ? insights.filter((item) => item.needReview) : insights;
   const aspectStats = aspectInsightStats(insights);
   const sentimentCounts = countInsightsBySentiment(insights);
   const keywordStats = keywordStatsByAspect(insights);
@@ -261,6 +269,56 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
     setImportResult(next);
     setReviews(next.reviews);
   };
+  const runAnalysis = async () => {
+    const targets = reviews;
+    const startTime = Date.now();
+    queueControl.current = { paused: false, stopped: false, abort: new AbortController() };
+    setLlmProgress({ ...makeInitialProgress(targets.length), running: true });
+    const nextInsights: Record<string, ReviewInsight> = {};
+    let analyzed = 0;
+    let success = 0;
+    let failed = 0;
+    let needReview = 0;
+
+    for (let index = 0; index < targets.length; index += 1) {
+      if (queueControl.current.stopped) break;
+      while (queueControl.current.paused && !queueControl.current.stopped) await new Promise((resolve) => setTimeout(resolve, 300));
+      const review = targets[index];
+      const ruleInsight = ruleInsightFor(review);
+      try {
+        let insight: ReviewInsight;
+        if (shouldUseRuleOnly(ruleInsight, absaMode)) {
+          insight = { ...ruleInsight, source: 'rule' };
+        } else {
+          const result = await analyzeWithLlm(review, llmConfig, queueControl.current.abort?.signal);
+          insight = resultToInsight(review, result, ruleInsight, absaMode === 'hybrid' ? 'hybrid' : 'llm');
+        }
+        nextInsights[review.id] = insight;
+        if (insight.source !== 'rule') success += 1;
+        if (insight.needReview) needReview += 1;
+      } catch {
+        nextInsights[review.id] = { ...ruleInsight, needReview: true, conflict: ['LLM调用失败'], source: 'hybrid' };
+        failed += 1;
+        needReview += 1;
+      }
+      analyzed += 1;
+      if (analyzed % Math.max(1, llmConfig.batchSize) === 0 || analyzed === targets.length) setLlmInsights((prev) => ({ ...prev, ...nextInsights }));
+      const elapsed = (Date.now() - startTime) / 1000;
+      const etaSeconds = analyzed ? Math.max(0, Math.round((elapsed / analyzed) * (targets.length - analyzed))) : 0;
+      setLlmProgress({ total: targets.length, analyzed, success, failed, needReview, etaSeconds, running: !queueControl.current.stopped && analyzed < targets.length, paused: queueControl.current.paused, stopped: queueControl.current.stopped });
+    }
+    setLlmInsights((prev) => ({ ...prev, ...nextInsights }));
+    setLlmProgress((prev) => ({ ...prev, running: false, paused: false, stopped: queueControl.current.stopped }));
+  };
+  const pauseAnalysis = () => { queueControl.current.paused = true; setLlmProgress((prev) => ({ ...prev, paused: true })); };
+  const resumeAnalysis = () => { queueControl.current.paused = false; setLlmProgress((prev) => ({ ...prev, paused: false })); };
+  const stopAnalysis = () => { queueControl.current.stopped = true; queueControl.current.abort?.abort(); setLlmProgress((prev) => ({ ...prev, running: false, stopped: true })); };
+  const confirmInsight = (id: string) => setLlmInsights((prev) => ({ ...prev, [id]: { ...(prev[id] || insights.find((item) => item.id === id)!), needReview: false, conflict: [] } }));
+  const confirmHighConfidence = () => setLlmInsights((prev) => {
+    const next = { ...prev };
+    insights.filter((item) => (item.confidence || 0) >= 0.85 && !item.conflict?.length).forEach((item) => { next[item.id] = { ...item, needReview: false }; });
+    return next;
+  });
   return (
     <div className="grid">
       <section className="panel">
@@ -293,6 +351,37 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
         )}
         <div className="sample-preview">
           {filtered.slice(0, 3).map((item) => <p className="muted" key={item.id}>“{item.text}”</p>)}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2 className="section-title">大模型ABSA分析模块</h2>
+        <p className="muted">LLM-ABSA用于减少人工标注和复核成本；规则ABSA用于快速初筛和兜底；人工复核只处理低置信度和冲突样本，最终形成高质量NEV-ABSA结构化数据。</p>
+        <div className="llm-config-grid">
+          <label><span className="muted">分析模式</span><select className="btn secondary" value={absaMode} onChange={(event) => setAbsaMode(event.target.value as AbsaMode)}><option value="rule">规则ABSA</option><option value="llm">LLM-ABSA</option><option value="hybrid">规则+LLM混合模式</option></select></label>
+          <label><span className="muted">API Provider</span><select className="btn secondary" value={llmConfig.provider} onChange={(event) => setLlmConfig({ ...llmConfig, provider: event.target.value as LlmAbsaConfig['provider'] })}><option>DeepSeek</option><option>OpenAI compatible</option><option>Qwen</option><option>Custom</option></select></label>
+          <label><span className="muted">Base URL</span><input className="input" value={llmConfig.baseUrl} onChange={(event) => setLlmConfig({ ...llmConfig, baseUrl: event.target.value })} /></label>
+          <label><span className="muted">Model Name</span><input className="input" value={llmConfig.modelName} onChange={(event) => setLlmConfig({ ...llmConfig, modelName: event.target.value })} /></label>
+          <label><span className="muted">Temperature</span><input className="input" type="number" step="0.1" value={llmConfig.temperature} onChange={(event) => setLlmConfig({ ...llmConfig, temperature: Number(event.target.value) })} /></label>
+          <label><span className="muted">Max Tokens</span><input className="input" type="number" value={llmConfig.maxTokens} onChange={(event) => setLlmConfig({ ...llmConfig, maxTokens: Number(event.target.value) })} /></label>
+          <label><span className="muted">Batch Size</span><input className="input" type="number" value={llmConfig.batchSize} onChange={(event) => setLlmConfig({ ...llmConfig, batchSize: Number(event.target.value) })} /></label>
+        </div>
+        <div className="llm-actions">
+          <button className="btn" onClick={runAnalysis} disabled={llmProgress.running}>开始分析</button>
+          <button className="btn secondary" onClick={pauseAnalysis} disabled={!llmProgress.running || llmProgress.paused}>暂停</button>
+          <button className="btn secondary" onClick={resumeAnalysis} disabled={!llmProgress.paused}>继续</button>
+          <button className="btn secondary" onClick={stopAnalysis} disabled={!llmProgress.running && !llmProgress.paused}>停止</button>
+          <span className="muted">API Key 从服务端环境变量读取：DEEPSEEK_API_KEY / OPENAI_API_KEY / QWEN_API_KEY。</span>
+        </div>
+        <div className="progress-wrap">
+          <div className="progress-bar"><span style={{ width: `${llmProgress.total ? (llmProgress.analyzed / llmProgress.total) * 100 : 0}%` }} /></div>
+          <div className="progress-stats">
+            <span>已分析 {llmProgress.analyzed}/{llmProgress.total || reviews.length}</span>
+            <span>成功 {llmProgress.success}</span>
+            <span>失败 {llmProgress.failed}</span>
+            <span>需复核 {llmProgress.needReview || insights.filter((item) => item.needReview).length}</span>
+            <span>预计剩余 {llmProgress.etaSeconds}s</span>
+          </div>
         </div>
       </section>
 
@@ -331,11 +420,20 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
       </section>
 
       <section className="panel">
+        <h2 className="section-title">人工复核工作台</h2>
+        <div className="review-toolbar">
+          <button className={`btn ${reviewFilter === 'all' ? '' : 'secondary'}`} onClick={() => setReviewFilter('all')}>全部样本</button>
+          <button className={`btn ${reviewFilter === 'needReview' ? '' : 'secondary'}`} onClick={() => setReviewFilter('needReview')}>仅看需复核</button>
+          <button className="btn secondary" onClick={confirmHighConfidence}>一键确认高置信度结果</button>
+        </div>
+      </section>
+
+      <section className="panel">
         <h2 className="section-title">结构化感知质量问题</h2>
         <select className="btn secondary" value={model} onChange={(event) => setModel(event.target.value)} style={{ marginBottom: 14 }}>{models.map((item) => <option key={item}>{item}</option>)}</select>
         <table className="table absa-table">
-          <thead><tr><th>原始评论</th><th>识别方面</th><th>情感方向</th><th>归因关键词</th><th>归因说明</th></tr></thead>
-          <tbody>{insights.map((item) => <tr key={item.id}><td className="muted review-text-cell">{item.rawText}</td><td><span className="tag">{item.aspect}</span></td><td><span className={`tag ${sentimentTone(item.sentiment)}`}>{sentimentLabel(item.sentiment)}</span></td><td><div className="tag-wrap">{item.keywords.map((keyword) => <span className="tag" key={keyword}>{keyword}</span>)}</div></td><td>{item.reason}</td></tr>)}</tbody>
+          <thead><tr><th>原始评论</th><th>分析来源</th><th>识别方面</th><th>观点词</th><th>情感方向</th><th>归因说明</th><th>置信度</th><th>复核</th></tr></thead>
+          <tbody>{visibleInsights.sort((a, b) => Number(b.needReview) - Number(a.needReview) || (a.confidence || 0) - (b.confidence || 0)).map((item) => <tr key={item.id}><td className="muted review-text-cell">{item.rawText}</td><td><span className="tag">{item.source || 'rule'}</span></td><td><span className="tag">{item.aspect}</span></td><td><div className="tag-wrap">{(item.keywords.length ? item.keywords : [item.opinion || '需人工复核']).map((keyword) => <span className="tag" key={keyword}>{keyword}</span>)}</div></td><td><span className={`tag ${sentimentTone(item.sentiment)}`}>{sentimentLabel(item.sentiment)}</span></td><td>{item.reason}{item.conflict?.length ? <p className="rose">冲突项：{item.conflict.join('、')}</p> : null}</td><td>{((item.confidence || 0) * 100).toFixed(0)}%</td><td>{item.needReview ? <button className="btn secondary" onClick={() => confirmInsight(item.id)}>确认</button> : <span className="tag green">已通过</span>}</td></tr>)}</tbody>
         </table>
       </section>
     </div>

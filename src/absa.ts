@@ -245,16 +245,23 @@ export function extractAbsa(text: string, fallbackSentiment?: Sentiment): AbsaRe
 export function extractReviewInsight(review: ReviewRecord): ReviewInsight {
   const result = extractAbsa(review.text, review.sentiment);
   const rule = aspectRules.find((item) => item.aspect === result.aspect);
+  const keywords = extractKeywords(review.text, rule);
+  const confidence = result.aspect === '综合体验' ? 0.48 : keywords.length ? 0.82 : 0.68;
   return {
     id: review.id,
     rawText: review.text,
     aspect: result.aspect,
+    opinion: result.opinion,
     sentiment: result.sentiment,
-    keywords: extractKeywords(review.text, rule),
+    keywords,
     reason: result.reason,
     model: review.model,
     platform: review.platform,
     date: review.date,
+    confidence,
+    needReview: confidence < 0.7 || result.aspect === '综合体验',
+    source: 'rule',
+    conflict: [],
   };
 }
 

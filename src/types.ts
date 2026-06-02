@@ -17,12 +17,17 @@ export interface ReviewInsight {
   id: string;
   rawText: string;
   aspect: string;
+  opinion?: string;
   sentiment: Sentiment;
   keywords: string[];
   reason: string;
   model: string;
   platform: string;
   date: string;
+  confidence?: number;
+  needReview?: boolean;
+  source?: 'rule' | 'llm' | 'hybrid';
+  conflict?: string[];
 }
 
 export interface ReviewImportResult {
@@ -32,6 +37,31 @@ export interface ReviewImportResult {
   reviews: ReviewRecord[];
   detectedTextColumn?: string;
   needsColumnSelection: boolean;
+}
+
+export type AbsaMode = 'rule' | 'llm' | 'hybrid';
+
+export interface LlmAbsaConfig {
+  provider: 'DeepSeek' | 'OpenAI compatible' | 'Qwen' | 'Custom';
+  baseUrl: string;
+  modelName: string;
+  temperature: number;
+  maxTokens: number;
+  batchSize: number;
+  promptVersion: string;
+}
+
+export interface LlmAbsaResult {
+  aspect: string;
+  opinion: string;
+  sentiment: Sentiment;
+  reason: string;
+  confidence: number;
+  needReview: boolean;
+  modelName: string;
+  promptVersion: string;
+  createdAt: string;
+  error?: string;
 }
 
 export interface QualityProblem {
