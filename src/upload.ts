@@ -1,11 +1,16 @@
 import * as XLSX from 'xlsx';
+import { inferAspectFromText, inferSentimentFromText } from './absa';
 import { ReviewRecord, Sentiment } from './types';
 
-const textKeys = ['评论', '评论文本', '内容', 'text', 'comment'];
-const modelKeys = ['车型', '车系', 'model', 'carModel'];
+const textKeys = ['评论', '评论文本', '评论内容', '内容', 'text', 'comment', 'comment_text', 'review'];
+const modelKeys = ['车型', '车系', 'series_name', 'model', 'carModel'];
 const platformKeys = ['平台', '来源', 'source', 'platform'];
-const dateKeys = ['时间', '日期', 'date', 'created_at'];
+const dateKeys = ['时间', '日期', 'date', 'created_at', 'pub_time', 'time'];
 const sentimentKeys = ['情感', '情感极性', 'label', 'sentiment'];
+const scoreKeys = ['评分', 'score', 'user_score', 'comment_score', 'star'];
+const ignoredTextKeys = ['index', 'id', 'comment_id', 'label', 'score', 'user_score', 'comment_score', 'pub_time', 'date', 'price', 'price_range'];
+const qualityKeywordPattern = /续航|油耗|电耗|操控|动力|车机|座舱|中控|空间|内饰|外观|悬架|悬挂|减震|底盘|充电|智驾|雷达|售后|配置|舒适|噪声|异响|性价比|刹车|制动|座椅|空调|发动机/;
+const mojibakePattern = /[åæçèéäöüÂÃ¤¦§¨©«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]|�/;
 
 function decodeText(buffer: ArrayBuffer) {
   const decoders = ['utf-8', 'gb18030', 'gbk'];
@@ -13,37 +18,40 @@ function decodeText(buffer: ArrayBuffer) {
     try {
       const text = new TextDecoder(encoding).decode(buffer);
       const replacementCount = (text.match(/\uFFFD/g) || []).length;
-      return { text, replacementCount };
+      const mojibakeCount = (text.match(mojibakePattern) || []).length;
+      return { text, score: replacementCount * 4 + mojibakeCount };
     } catch {
-      return { text: '', replacementCount: Number.POSITIVE_INFINITY };
+      return { text: '', score: Number.POSITIVE_INFINITY };
     }
   });
-  return decoded.sort((a, b) => a.replacementCount - b.replacementCount)[0].text;
+  return decoded.sort((a, b) => a.score - b.score)[0].text;
+}
+
+function normalizeKey(key: string) {
+  return key.toLowerCase().replace(/[\s_-]/g, '');
 }
 
 function pick(row: Record<string, unknown>, keys: string[]) {
-  const matched = Object.keys(row).find((key) => keys.some((candidate) => key.toLowerCase().includes(candidate.toLowerCase())));
+  const matched = Object.keys(row).find((key) => keys.some((candidate) => normalizeKey(key).includes(normalizeKey(candidate))));
   return matched ? String(row[matched] ?? '') : '';
 }
 
-function parseSentiment(value: string, text: string): Sentiment {
+function parseSentiment(value: string, text: string, scoreValue = ''): Sentiment {
   const raw = value.trim().toLowerCase();
   if (['1', 'positive', '正面', '积极'].some((key) => raw.includes(key))) return 'positive';
   if (['0', '-1', 'negative', '负面', '消极'].some((key) => raw.includes(key))) return 'negative';
   if (['neutral', '中性'].some((key) => raw.includes(key))) return 'neutral';
-  return /差|慢|卡|异响|衰减|缩水|投诉|误报|不满|掉电|不舒服/.test(text) ? 'negative' : 'neutral';
-}
-
-function inferAspect(text: string) {
-  const rules: Array<[RegExp, string, string]> = [
-    [/续航|掉电|电耗|热泵|BMS|电池|低温|缩水/, '续航与能耗', '续航/热管理'],
-    [/车机|座舱|语音|HUD|屏|卡顿|黑屏|SoC/, '智能座舱', '座舱交互体验'],
-    [/智驾|雷达|辅助驾驶|误报|制动/, '智能驾驶', '感知与控制'],
-    [/悬架|底盘|异响|噪声|NVH|座椅/, '舒适性与NVH', '舒适性问题'],
-    [/充电|快充|限流/, '充电体验', '充电效率'],
-    [/空间|风噪|密封/, '空间表现', '空间与密封'],
-  ];
-  return rules.find(([rule]) => rule.test(text)) || [/.*/, '综合体验', '综合评价'];
+  const numericScore = Number(scoreValue || raw);
+  if (Number.isFinite(numericScore)) {
+    if (numericScore <= 5) {
+      if (numericScore >= 4) return 'positive';
+      if (numericScore <= 2.5) return 'negative';
+    } else {
+      if (numericScore >= 70) return 'positive';
+      if (numericScore <= 45) return 'negative';
+    }
+  }
+  return inferSentimentFromText(text);
 }
 
 function detectDelimiter(text: string) {
@@ -83,12 +91,34 @@ function parseTextRows(content: string) {
   });
 }
 
+function textColumnScore(key: string, values: string[]) {
+  const normalizedKey = normalizeKey(key);
+  if (ignoredTextKeys.some((item) => normalizedKey === normalizeKey(item) || normalizedKey.includes(normalizeKey(item)))) return -10000;
+  const keyBonus = textKeys.some((candidate) => normalizedKey.includes(normalizeKey(candidate))) ? 500 : 0;
+  const sample = values.slice(0, 80).join('');
+  const chineseCount = (sample.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const keywordCount = (sample.match(qualityKeywordPattern) || []).length;
+  const digitCount = (sample.match(/\d/g) || []).length;
+  const avgLength = values.length ? values.slice(0, 80).reduce((sum, item) => sum + item.length, 0) / Math.min(values.length, 80) : 0;
+  return keyBonus + chineseCount * 2 + keywordCount * 30 + avgLength * 3 - digitCount * 0.4;
+}
+
+function chooseTextKey(rows: Record<string, unknown>[]) {
+  const keys = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  const direct = keys.find((key) => textKeys.some((candidate) => normalizeKey(key).includes(normalizeKey(candidate))));
+  if (direct) return direct;
+  return keys
+    .map((key) => ({ key, score: textColumnScore(key, rows.map((row) => String(row[key] ?? ''))) }))
+    .sort((a, b) => b.score - a.score)[0]?.key;
+}
+
 function rowsToReviews(rows: Record<string, unknown>[]) {
+  const textKey = chooseTextKey(rows);
   return rows
     .map((row, index) => {
-      const text = pick(row, textKeys) || Object.values(row).map(String).join(' ');
-      const [, aspect, subAspect] = inferAspect(text);
-      const sentiment = parseSentiment(pick(row, sentimentKeys), text);
+      const text = textKey ? String(row[textKey] ?? '') : pick(row, textKeys);
+      const { aspect, subAspect } = inferAspectFromText(text);
+      const sentiment = parseSentiment(pick(row, sentimentKeys), text, pick(row, scoreKeys));
       return {
         id: `u${index + 1}`,
         model: pick(row, modelKeys) || '上传车型',

@@ -5,10 +5,11 @@ import { motion } from 'framer-motion';
 import * as XLSX from 'xlsx';
 import ReactFlow, { Background, Controls, Edge, Node, useEdgesState, useNodesState } from 'react-flow-renderer';
 import ReactECharts from './ReactECharts';
+import { extractAbsa } from './absa';
 import { engineeringFeatures, problems, qfdRelations, reports, reviews as seedReviews, scmRecommendations, warnings } from './data';
-import { featurePriority, getKpis, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
+import { featurePriority, getFdaScore, getKanoCoefficient, getKanoColor, getKanoLabel, getKpis, getPriorityExplanation, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
 import { parseReviewFile } from './upload';
-import { QualityProblem, ReviewRecord } from './types';
+import { KanoCategory, QualityProblem, ReviewRecord } from './types';
 
 type PageKey = 'dashboard' | 'reviews' | 'diagnosis' | 'qfd' | 'scm' | 'case' | 'reports';
 
@@ -24,26 +25,29 @@ const pages: Array<{ key: PageKey; name: string; icon: typeof Gauge }> = [
 
 const chartText = { color: '#9fb3cc' };
 const chartGrid = { top: 32, left: 42, right: 24, bottom: 40 };
-
-function absaExtract(review: ReviewRecord) {
-  const text = review.text;
-  if (/续航|掉电|低温|BMS|电池|缩水/.test(text)) {
-    return { aspect: '续航', opinion: /掉电|缩水/.test(text) ? '掉电太快' : '低温续航衰减', reason: '低温衰减明显，电池热管理与BMS策略需要协同优化' };
-  }
-  if (/车机|屏|卡顿|黑屏|语音|HUD|SoC/.test(text)) {
-    return { aspect: '车机', opinion: /卡顿/.test(text) ? '高负载卡顿' : '交互响应不稳定', reason: '座舱域控资源调度、系统优化与软件响应时间存在改进空间' };
-  }
-  if (/悬架|底盘|异响|噪声|NVH|座椅/.test(text)) {
-    return { aspect: '舒适性', opinion: /异响|噪声|挤压声/.test(text) ? '异响明显' : '舒适性不足', reason: '底盘、座椅、密封相关工程特征与装配一致性需要复核' };
-  }
-  if (/智驾|雷达|误报|制动|辅助驾驶/.test(text)) {
-    return { aspect: '智能驾驶', opinion: '极端场景误报', reason: '雨雾噪声过滤、感知融合与控制策略需要联合标定' };
-  }
-  if (/充电|快充|限流/.test(text)) {
-    return { aspect: '充电', opinion: '快充限流或效率下降', reason: '充电热管理、BMS充电策略与服务体验存在协同优化空间' };
-  }
-  return { aspect: review.aspect, opinion: review.subAspect, reason: '该评论反映了用户体验与工程质量特征之间的潜在对应关系' };
-}
+const kanoOrder: KanoCategory[] = ['Must-be', 'One-dimensional', 'Attractive'];
+const kanoDefinitions: Record<KanoCategory, { title: string; description: string; examples: string[] }> = {
+  'Must-be': {
+    title: '基本型需求 Must-be',
+    description: '不满足会引发强烈不满，满足后用户认为理所当然。',
+    examples: ['冬季续航衰减', '空气悬架异响', '雨天智驾误报'],
+  },
+  'One-dimensional': {
+    title: '期望型需求 One-dimensional',
+    description: '满足程度越高，用户满意度越高。',
+    examples: ['车机卡顿', '充电体验', '空间表现'],
+  },
+  Attractive: {
+    title: '魅力型需求 Attractive',
+    description: '超出预期会显著提升满意度，不满足时用户不一定抱怨。',
+    examples: ['HUD显示', '露营模式', '智能场景联动'],
+  },
+  Indifferent: {
+    title: '无差异需求 Indifferent',
+    description: '用户关注度较低，通常不作为优先改进方向。',
+    examples: ['低频装饰配置'],
+  },
+};
 
 export default function App() {
   const [active, setActive] = useState<PageKey>('dashboard');
@@ -154,8 +158,9 @@ function Dashboard({ kpis, reviews }: { kpis: ReturnType<typeof getKpis>; review
           {topProblems.map((problem, index) => (
             <div className="flow-node" key={problem.id} style={{ marginBottom: 12 }}>
               <strong>{index + 1}. {problem.name}</strong>
-              <span className="tag" style={{ float: 'right' }}>PI: {problem.pi}</span>
-              <p className="muted">领域：{problem.aspect}｜Kano：{problem.kano}</p>
+              <span className="tag" style={{ float: 'right', borderColor: getKanoColor(problem.kano), color: getKanoColor(problem.kano) }}>Final PI: {problem.pi}</span>
+              <p className="muted">Kano：{getKanoLabel(problem.kano)}｜FDA：{getFdaScore(problem)}｜Final PI：{problem.pi}</p>
+              <p className="muted">{getPriorityExplanation(problem.kano)}</p>
             </div>
           ))}
         </section>
@@ -222,7 +227,7 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
         <select className="btn secondary" value={model} onChange={(event) => setModel(event.target.value)} style={{ marginBottom: 14 }}>{models.map((item) => <option key={item}>{item}</option>)}</select>
         <table className="table absa-table">
           <thead><tr><th>Aspect（方面）</th><th>Opinion（观点）</th><th>Sentiment（情感）</th><th>Reason（原因）</th><th>原始评论</th></tr></thead>
-          <tbody>{filtered.map((item) => { const result = absaExtract(item); return <tr key={item.id}><td><span className="tag">{result.aspect}</span></td><td>{result.opinion}</td><td><span className={`tag ${item.sentiment === 'negative' ? 'rose' : item.sentiment === 'positive' ? 'green' : ''}`}>{sentimentLabel(item.sentiment)}</span></td><td>{result.reason}</td><td className="muted">{item.text}</td></tr>; })}</tbody>
+          <tbody>{filtered.map((item) => { const result = extractAbsa(item.text, item.sentiment); return <tr key={item.id}><td><span className="tag">{result.aspect}</span></td><td>{result.opinion}</td><td><span className={`tag ${result.sentiment === 'negative' ? 'rose' : result.sentiment === 'positive' ? 'green' : ''}`}>{sentimentLabel(result.sentiment)}</span></td><td>{result.reason}</td><td className="muted review-text-cell">{item.text}</td></tr>; })}</tbody>
         </table>
       </section>
     </div>
@@ -230,20 +235,85 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
 }
 
 function Diagnosis({ selectedProblem, setSelectedProblemId, onJumpToQfd }: { selectedProblem: QualityProblem; setSelectedProblemId: (id: string) => void; onJumpToQfd: (id: string) => void }) {
+  const scatterSeries = kanoOrder.map((kano) => ({
+    name: getKanoLabel(kano),
+    type: 'scatter' as const,
+    symbolSize: (data: Array<string | number>) => Math.max(18, Number(data[2] || 10) * 1.05),
+    data: problems
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.kano === kano)
+      .map(({ item, index }) => [item.attention, item.dissatisfaction, item.pi, item.name, index]),
+    itemStyle: { color: getKanoColor(kano) },
+    label: { show: true, formatter: (p: unknown) => { const params = p as { data?: Array<string | number> }; return String(Math.round(Number(params.data?.[2] || 0))); }, color: '#06111f', fontWeight: 800 },
+  }));
+  const selectedFda = getFdaScore(selectedProblem);
+  const selectedCoefficient = getKanoCoefficient(selectedProblem.kano);
+
   return (
-    <div className="grid cols-2">
+    <div className="grid">
       <section className="panel">
-        <h2 className="section-title">FDA三维诊断气泡图</h2>
-        <ReactECharts className="chart" option={{ tooltip: {}, grid: chartGrid, xAxis: { name: '关注度A', min: 45, max: 100, axisLabel: chartText }, yAxis: { name: '不满意度D', min: 45, max: 100, axisLabel: chartText }, series: [{ type: 'scatter', symbolSize: (data: any) => Number(data[2] || 10) * 1.2, data: problems.map((item) => [item.attention, item.dissatisfaction, item.pi, item.name]), itemStyle: { color: '#22d3ee' }, label: { show: true, formatter: (p: any) => String(Math.round(Number(p.data[2]))), color: '#06111f' } }] }} onEvents={{ click: (params: { dataIndex: number }) => setSelectedProblemId(problems[params.dataIndex].id) }} />
+        <h2 className="section-title">Kano-FDA 联合诊断方法链</h2>
+        <div className="method-chain">
+          {[
+            ['ABSA', '出了什么问题', '从评论中抽取方面、观点、情感与原因。'],
+            ['Kano', '属于什么需求', '识别基本型、期望型与魅力型需求属性。'],
+            ['FDA', '先改什么', '衡量关注度、不满意度和情感强度。'],
+            ['QFD', '改什么', '将用户语言转化为工程质量特征。'],
+            ['供应链映射', '谁来协同改', '推荐潜在协同主体与协同方式。'],
+          ].map(([title, question, desc]) => <div className="method-card" key={title}><span className="tag">{title}</span><h3>{question}</h3><p className="muted">{desc}</p></div>)}
+        </div>
       </section>
-      <section className="panel">
-        <h2 className="section-title">问题归因分析</h2>
-        <span className="tag">PI: {selectedProblem.pi}</span>
-        <h2>{selectedProblem.name}</h2>
-        <p>{selectedProblem.attribution}</p>
-        {selectedProblem.typicalComments.map((comment) => <p className="muted" key={comment}>“{comment}”</p>)}
-        <button className="btn" onClick={() => onJumpToQfd(selectedProblem.id)}>一键转入 QFD 质量屋</button>
-      </section>
+      <div className="grid cols-2">
+        <section className="panel">
+          <h2 className="section-title">Kano-FDA联合诊断图</h2>
+          <p className="muted">颜色表示 Kano 需求属性；气泡大小表示综合优先级 PI。</p>
+          <ReactECharts
+            className="chart"
+            option={{
+              tooltip: { formatter: (p: unknown) => { const params = p as { data: Array<string | number>; seriesName: string }; return `${params.data[3]}<br/>${params.seriesName}<br/>关注度A：${params.data[0]}<br/>不满意度D：${params.data[1]}<br/>Final PI：${params.data[2]}`; } },
+              legend: { textStyle: chartText, top: 0 },
+              grid: { ...chartGrid, top: 58 },
+              xAxis: { name: '关注度 A', min: 45, max: 100, axisLabel: chartText, splitLine: { lineStyle: { color: '#1e293b' } } },
+              yAxis: { name: '不满意度 D', min: 45, max: 100, axisLabel: chartText, splitLine: { lineStyle: { color: '#1e293b' } } },
+              series: scatterSeries,
+            }}
+            onEvents={{ click: (params: { data: unknown[] }) => setSelectedProblemId(problems[Number(params.data[4])].id) }}
+          />
+        </section>
+        <section className="panel">
+          <h2 className="section-title">问题归因分析</h2>
+          <div className="detail-grid">
+            <Kpi title="FDA得分" value={selectedFda} hint="未加入Kano系数前的严重程度" tone="cyan" />
+            <Kpi title="Kano修正系数" value={selectedCoefficient} hint={getKanoLabel(selectedProblem.kano)} tone={selectedProblem.kano === 'Must-be' ? 'rose' : selectedProblem.kano === 'Attractive' ? 'green' : 'cyan'} />
+            <Kpi title="最终PI值" value={selectedProblem.pi} hint={getPriorityExplanation(selectedProblem.kano)} tone="amber" />
+          </div>
+          <h2>{selectedProblem.name}</h2>
+          <p className="muted">所属领域：{selectedProblem.aspect}｜Kano类型：{getKanoLabel(selectedProblem.kano)}</p>
+          <p>{selectedProblem.attribution}</p>
+          <h3>典型评论证据</h3>
+          {selectedProblem.typicalComments.map((comment) => <p className="muted evidence" key={comment}>“{comment}”</p>)}
+          <button className="btn" onClick={() => onJumpToQfd(selectedProblem.id)}>推荐下一步：转入 QFD 工程转化</button>
+        </section>
+      </div>
+      <div className="grid cols-2">
+        <section className="panel">
+          <h2 className="section-title">Kano需求属性分布</h2>
+          <div className="kano-grid">
+            {kanoOrder.map((kano) => {
+              const definition = kanoDefinitions[kano];
+              const tags = [...problems.filter((item) => item.kano === kano).map((item) => item.name), ...definition.examples].slice(0, 5);
+              return <div className="kano-card" key={kano} style={{ borderColor: getKanoColor(kano) }}><h3 style={{ color: getKanoColor(kano) }}>{definition.title}</h3><p className="muted">{definition.description}</p><div className="tag-wrap">{tags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}</div></div>;
+            })}
+          </div>
+        </section>
+        <section className="panel">
+          <h2 className="section-title">优先级计算说明</h2>
+          <div className="formula-box">FDA得分 = wA × Z(A) + wD × Z(D) + wI × Z(I)</div>
+          <div className="formula-box">最终优先级 = FDA得分 × Kano修正系数</div>
+          <p className="muted">Kano修正系数示例：Must-be = 1.2，One-dimensional = 1.0，Attractive = 0.8。系数可根据专家评价或敏感性分析调整。</p>
+          <p className="muted">Kano不是简单标签，而是需求属性识别工具；FDA不是单纯图表，而是改进优先级诊断工具。联合诊断体现“需求属性 + 问题严重程度”的综合判断。</p>
+        </section>
+      </div>
     </div>
   );
 }

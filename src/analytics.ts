@@ -1,7 +1,39 @@
-import { EngineeringFeature, QfdRelation, QualityProblem, ReviewRecord, Sentiment } from './types';
+import { EngineeringFeature, KanoCategory, QfdRelation, QualityProblem, ReviewRecord, Sentiment } from './types';
 
 export function sentimentLabel(sentiment: Sentiment) {
   return sentiment === 'positive' ? '正面积极' : sentiment === 'neutral' ? '中性客观' : '负面问题';
+}
+
+export function getKanoCoefficient(kano: KanoCategory) {
+  if (kano === 'Must-be') return 1.2;
+  if (kano === 'One-dimensional') return 1.0;
+  if (kano === 'Attractive') return 0.8;
+  return 0.7;
+}
+
+export function getFdaScore(problem: QualityProblem) {
+  return Number((problem.pi / getKanoCoefficient(problem.kano)).toFixed(1));
+}
+
+export function getKanoLabel(kano: KanoCategory) {
+  if (kano === 'Must-be') return 'Must-be 基本型需求';
+  if (kano === 'One-dimensional') return 'One-dimensional 期望型需求';
+  if (kano === 'Attractive') return 'Attractive 魅力型需求';
+  return 'Indifferent 无差异需求';
+}
+
+export function getKanoColor(kano: KanoCategory) {
+  if (kano === 'Must-be') return '#fb7185';
+  if (kano === 'One-dimensional') return '#38bdf8';
+  if (kano === 'Attractive') return '#34d399';
+  return '#94a3b8';
+}
+
+export function getPriorityExplanation(kano: KanoCategory) {
+  if (kano === 'Must-be') return '基本型需求，经Kano修正后优先级上调。';
+  if (kano === 'One-dimensional') return '期望型需求，按FDA严重程度确定改进顺序。';
+  if (kano === 'Attractive') return '魅力型需求，可作为体验增益项但修正系数较低。';
+  return '无差异需求，建议保持监测并结合样本规模复核。';
 }
 
 export function getKpis(reviews: ReviewRecord[], problems: QualityProblem[], collaboratorCount: number) {
