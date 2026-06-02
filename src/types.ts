@@ -41,9 +41,14 @@ export interface ReviewImportResult {
 
 export type AbsaMode = 'rule' | 'llm' | 'hybrid';
 
+export type LlmCallMode = 'server' | 'browser' | 'ollama';
+
 export interface LlmAbsaConfig {
-  provider: 'DeepSeek' | 'OpenAI compatible' | 'Qwen' | 'Custom';
+  provider: 'DeepSeek' | 'OpenAI compatible' | 'Qwen' | 'Custom' | 'Ollama';
+  callMode: LlmCallMode;
+  apiKey?: string;
   baseUrl: string;
+  ollamaEndpoint?: string;
   modelName: string;
   temperature: number;
   maxTokens: number;

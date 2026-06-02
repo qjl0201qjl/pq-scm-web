@@ -359,19 +359,35 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
         <p className="muted">LLM-ABSA用于减少人工标注和复核成本；规则ABSA用于快速初筛和兜底；人工复核只处理低置信度和冲突样本，最终形成高质量NEV-ABSA结构化数据。</p>
         <div className="llm-config-grid">
           <label><span className="muted">分析模式</span><select className="btn secondary" value={absaMode} onChange={(event) => setAbsaMode(event.target.value as AbsaMode)}><option value="rule">规则ABSA</option><option value="llm">LLM-ABSA</option><option value="hybrid">规则+LLM混合模式</option></select></label>
-          <label><span className="muted">API Provider</span><select className="btn secondary" value={llmConfig.provider} onChange={(event) => setLlmConfig({ ...llmConfig, provider: event.target.value as LlmAbsaConfig['provider'] })}><option>DeepSeek</option><option>OpenAI compatible</option><option>Qwen</option><option>Custom</option></select></label>
+          <label><span className="muted">调用通道</span><select className="btn secondary" value={llmConfig.callMode} onChange={(event) => setLlmConfig({ ...llmConfig, callMode: event.target.value as LlmAbsaConfig['callMode'] })}><option value="server">Vercel服务端代理</option><option value="browser">网页端直连API Key</option><option value="ollama">本地Ollama</option></select></label>
+          <label><span className="muted">API Provider</span><select className="btn secondary" value={llmConfig.provider} onChange={(event) => {
+            const provider = event.target.value as LlmAbsaConfig['provider'];
+            setLlmConfig({
+              ...llmConfig,
+              provider,
+              callMode: provider === 'Ollama' ? 'ollama' : llmConfig.callMode,
+              baseUrl: provider === 'DeepSeek' ? 'https://api.deepseek.com' : provider === 'Qwen' ? 'https://dashscope.aliyuncs.com/compatible-mode' : llmConfig.baseUrl,
+              modelName: provider === 'Ollama' ? 'qwen2.5:7b' : provider === 'DeepSeek' ? 'deepseek-chat' : llmConfig.modelName,
+            });
+          }}><option>DeepSeek</option><option>OpenAI compatible</option><option>Qwen</option><option>Custom</option><option>Ollama</option></select></label>
           <label><span className="muted">Base URL</span><input className="input" value={llmConfig.baseUrl} onChange={(event) => setLlmConfig({ ...llmConfig, baseUrl: event.target.value })} /></label>
+          <label><span className="muted">网页端 API Key</span><input className="input" type="password" placeholder="仅浏览器直连模式需要填写" value={llmConfig.apiKey || ''} onChange={(event) => setLlmConfig({ ...llmConfig, apiKey: event.target.value })} /></label>
+          <label><span className="muted">Ollama 地址</span><input className="input" placeholder="http://127.0.0.1:11434" value={llmConfig.ollamaEndpoint || ''} onChange={(event) => setLlmConfig({ ...llmConfig, ollamaEndpoint: event.target.value })} /></label>
           <label><span className="muted">Model Name</span><input className="input" value={llmConfig.modelName} onChange={(event) => setLlmConfig({ ...llmConfig, modelName: event.target.value })} /></label>
           <label><span className="muted">Temperature</span><input className="input" type="number" step="0.1" value={llmConfig.temperature} onChange={(event) => setLlmConfig({ ...llmConfig, temperature: Number(event.target.value) })} /></label>
           <label><span className="muted">Max Tokens</span><input className="input" type="number" value={llmConfig.maxTokens} onChange={(event) => setLlmConfig({ ...llmConfig, maxTokens: Number(event.target.value) })} /></label>
           <label><span className="muted">Batch Size</span><input className="input" type="number" value={llmConfig.batchSize} onChange={(event) => setLlmConfig({ ...llmConfig, batchSize: Number(event.target.value) })} /></label>
+        </div>
+        <div className="flow-node" style={{ marginTop: 12 }}>
+          <strong>调用方式说明</strong>
+          <p className="muted">Vercel服务端代理适合正式在线演示，API Key 放在 Vercel 环境变量中；网页端直连适合个人临时测试，但不要在公共电脑保存密钥；本地 Ollama 适合无外网和本地模型实验，默认地址为 http://127.0.0.1:11434。</p>
         </div>
         <div className="llm-actions">
           <button className="btn" onClick={runAnalysis} disabled={llmProgress.running}>开始分析</button>
           <button className="btn secondary" onClick={pauseAnalysis} disabled={!llmProgress.running || llmProgress.paused}>暂停</button>
           <button className="btn secondary" onClick={resumeAnalysis} disabled={!llmProgress.paused}>继续</button>
           <button className="btn secondary" onClick={stopAnalysis} disabled={!llmProgress.running && !llmProgress.paused}>停止</button>
-          <span className="muted">API Key 从服务端环境变量读取：DEEPSEEK_API_KEY / OPENAI_API_KEY / QWEN_API_KEY。</span>
+          <span className="muted">推荐公开网站使用服务端代理；个人实验可在网页端临时填写 API Key；离线实验可连接本地 Ollama。</span>
         </div>
         <div className="progress-wrap">
           <div className="progress-bar"><span style={{ width: `${llmProgress.total ? (llmProgress.analyzed / llmProgress.total) * 100 : 0}%` }} /></div>

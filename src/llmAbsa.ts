@@ -3,7 +3,10 @@ import { AbsaMode, LlmAbsaConfig, LlmAbsaResult, ReviewInsight, ReviewRecord, Se
 
 export const defaultLlmConfig: LlmAbsaConfig = {
   provider: 'DeepSeek',
+  callMode: 'server',
+  apiKey: '',
   baseUrl: 'https://api.deepseek.com',
+  ollamaEndpoint: 'http://127.0.0.1:11434',
   modelName: 'deepseek-chat',
   temperature: 0.2,
   maxTokens: 500,
@@ -44,7 +47,7 @@ function normalizeSentiment(input: string): Sentiment {
 }
 
 function cacheKey(hash: string, config: LlmAbsaConfig) {
-  return `${cachePrefix}${config.promptVersion}:${config.modelName}:${hash}`;
+  return `${cachePrefix}${config.promptVersion}:${config.callMode}:${config.modelName}:${hash}`;
 }
 
 async function getCached(text: string, config: LlmAbsaConfig) {
@@ -88,6 +91,112 @@ function toLlmResult(payload: Record<string, unknown>, config: LlmAbsaConfig): L
   };
 }
 
+function makePrompt(commentText: string) {
+  return {
+    system: '你是新能源汽车感知质量分析助手。你的任务是对用户评论进行方面级情感分析。请严格根据评论文本判断，不要编造不存在的信息。输出必须是合法JSON。',
+    user: `请分析以下新能源汽车用户评论，并输出方面级情感分析结果。
+
+评论文本：
+${commentText}
+
+分析要求：
+1. 识别评论涉及的主要方面类别。
+2. 提取对应观点词或观点短语。
+3. 判断情感方向：正面、中性、负面。
+4. 用一句话说明情感归因。
+5. 给出置信度，范围0到1。
+6. 判断是否需要人工复核。
+
+方面类别只能从以下列表中选择：
+${aspectList.join('、')}。
+
+输出JSON格式如下：
+{
+  "aspect": "",
+  "opinion": "",
+  "sentiment": "",
+  "reason": "",
+  "confidence": 0.0,
+  "need_review": false
+}
+
+判定规则：
+- 如果评论涉及多个方面，选择最主要的方面。
+- 如果情感不明确，sentiment填“中性”，confidence低于0.6，need_review为true。
+- 如果评论过短、乱码、无意义，aspect填“其他”，sentiment填“中性”，need_review为true。
+- 不要输出解释文字，只输出JSON。`,
+  };
+}
+
+function joinUrl(baseUrl: string, path: string) {
+  return `${baseUrl.replace(/\/+$/, '')}${path}`;
+}
+
+async function callOpenAiCompatible(commentText: string, config: LlmAbsaConfig, signal?: AbortSignal) {
+  if (!config.apiKey?.trim()) throw new Error('浏览器直连模式需要填写 API Key。');
+  const prompt = makePrompt(commentText);
+  const response = await fetch(joinUrl(config.baseUrl, '/v1/chat/completions'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey.trim()}`,
+    },
+    body: JSON.stringify({
+      model: config.modelName,
+      temperature: config.temperature,
+      max_tokens: config.maxTokens,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+    }),
+    signal,
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  return payload.choices?.[0]?.message?.content || payload.content || payload.result || payload;
+}
+
+async function callOllama(commentText: string, config: LlmAbsaConfig, signal?: AbortSignal) {
+  const prompt = makePrompt(commentText);
+  const response = await fetch(joinUrl(config.ollamaEndpoint || config.baseUrl || 'http://127.0.0.1:11434', '/api/chat'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: config.modelName,
+      stream: false,
+      format: 'json',
+      options: {
+        temperature: config.temperature,
+        num_predict: config.maxTokens,
+      },
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+    }),
+    signal,
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  return payload.message?.content || payload.response || payload;
+}
+
+async function callLlm(commentText: string, config: LlmAbsaConfig, signal?: AbortSignal) {
+  if (config.callMode === 'browser') return callOpenAiCompatible(commentText, config, signal);
+  if (config.callMode === 'ollama') return callOllama(commentText, config, signal);
+  const response = await fetch('/api/llm-absa', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commentText, config }),
+    signal,
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  return payload.content || payload.result || payload;
+}
+
 export function conflictsBetween(rule: ReviewInsight, llm: LlmAbsaResult) {
   const conflicts: string[] = [];
   if (rule.aspect !== '综合体验' && rule.aspect !== llm.aspect) conflicts.push('方面冲突');
@@ -123,15 +232,7 @@ export async function analyzeWithLlm(review: ReviewRecord, config: LlmAbsaConfig
   let lastError = '';
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await fetch('/api/llm-absa', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ commentText: review.text, config }),
-        signal,
-      });
-      if (!response.ok) throw new Error(await response.text());
-      const payload = await response.json();
-      const content = payload.content || payload.result || payload;
+      const content = await callLlm(review.text, config, signal);
       const parsed = typeof content === 'string' ? extractJson(content) : content;
       const result = toLlmResult(parsed, config);
       await setCached(review.text, config, result);
