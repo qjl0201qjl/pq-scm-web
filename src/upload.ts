@@ -7,6 +7,20 @@ const platformKeys = ['平台', '来源', 'source', 'platform'];
 const dateKeys = ['时间', '日期', 'date', 'created_at'];
 const sentimentKeys = ['情感', '情感极性', 'label', 'sentiment'];
 
+function decodeText(buffer: ArrayBuffer) {
+  const decoders = ['utf-8', 'gb18030', 'gbk'];
+  const decoded = decoders.map((encoding) => {
+    try {
+      const text = new TextDecoder(encoding).decode(buffer);
+      const replacementCount = (text.match(/\uFFFD/g) || []).length;
+      return { text, replacementCount };
+    } catch {
+      return { text: '', replacementCount: Number.POSITIVE_INFINITY };
+    }
+  });
+  return decoded.sort((a, b) => a.replacementCount - b.replacementCount)[0].text;
+}
+
 function pick(row: Record<string, unknown>, keys: string[]) {
   const matched = Object.keys(row).find((key) => keys.some((candidate) => key.toLowerCase().includes(candidate.toLowerCase())));
   return matched ? String(row[matched] ?? '') : '';
@@ -93,7 +107,7 @@ function rowsToReviews(rows: Record<string, unknown>[]) {
 export async function parseReviewFile(file: File): Promise<ReviewRecord[]> {
   const lowerName = file.name.toLowerCase();
   if (lowerName.endsWith('.tsv') || lowerName.endsWith('.csv')) {
-    const content = await file.text();
+    const content = decodeText(await file.arrayBuffer());
     return rowsToReviews(parseTextRows(content));
   }
 
