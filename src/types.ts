@@ -13,6 +13,27 @@ export interface ReviewRecord {
   score: number;
 }
 
+export interface ReviewInsight {
+  id: string;
+  rawText: string;
+  aspect: string;
+  sentiment: Sentiment;
+  keywords: string[];
+  reason: string;
+  model: string;
+  platform: string;
+  date: string;
+}
+
+export interface ReviewImportResult {
+  fileName: string;
+  rows: Record<string, unknown>[];
+  columns: string[];
+  reviews: ReviewRecord[];
+  detectedTextColumn?: string;
+  needsColumnSelection: boolean;
+}
+
 export interface QualityProblem {
   id: string;
   name: string;

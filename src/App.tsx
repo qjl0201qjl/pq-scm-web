@@ -5,11 +5,11 @@ import { motion } from 'framer-motion';
 import * as XLSX from 'xlsx';
 import ReactFlow, { Background, Controls, Edge, Node, useEdgesState, useNodesState } from 'react-flow-renderer';
 import ReactECharts from './ReactECharts';
-import { extractAbsa } from './absa';
+import { extractReviewInsight } from './absa';
 import { engineeringFeatures, problems, qfdRelations, reports, reviews as seedReviews, scmRecommendations, warnings } from './data';
 import { featurePriority, getFdaScore, getKanoCoefficient, getKanoColor, getKanoLabel, getKpis, getPriorityExplanation, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
-import { parseReviewFile } from './upload';
-import { KanoCategory, QualityProblem, ReviewRecord } from './types';
+import { parseReviewFile, rebuildReviewImportResult } from './upload';
+import { KanoCategory, QualityProblem, ReviewImportResult, ReviewRecord, Sentiment } from './types';
 
 type PageKey = 'dashboard' | 'reviews' | 'diagnosis' | 'qfd' | 'scm' | 'case' | 'reports';
 
@@ -196,38 +196,146 @@ function Kpi({ title, value, hint, tone }: { title: string; value: string | numb
   );
 }
 
+function sentimentTone(sentiment: Sentiment): 'cyan' | 'rose' | 'amber' | 'green' {
+  if (sentiment === 'positive') return 'green';
+  if (sentiment === 'negative') return 'rose';
+  return 'amber';
+}
+
+function countInsightsBySentiment(insights: ReturnType<typeof extractReviewInsight>[]) {
+  return {
+    positive: insights.filter((item) => item.sentiment === 'positive').length,
+    neutral: insights.filter((item) => item.sentiment === 'neutral').length,
+    negative: insights.filter((item) => item.sentiment === 'negative').length,
+  };
+}
+
+function aspectInsightStats(insights: ReturnType<typeof extractReviewInsight>[]) {
+  const total = insights.length || 1;
+  return Array.from(new Set(insights.map((item) => item.aspect))).map((aspect) => {
+    const items = insights.filter((item) => item.aspect === aspect);
+    return {
+      aspect,
+      count: items.length,
+      ratio: Number(((items.length / total) * 100).toFixed(1)),
+      positive: items.filter((item) => item.sentiment === 'positive').length,
+      neutral: items.filter((item) => item.sentiment === 'neutral').length,
+      negative: items.filter((item) => item.sentiment === 'negative').length,
+    };
+  }).sort((a, b) => b.count - a.count);
+}
+
+function keywordStatsByAspect(insights: ReturnType<typeof extractReviewInsight>[]) {
+  return aspectInsightStats(insights).slice(0, 8).map(({ aspect }) => {
+    const counts = insights
+      .filter((item) => item.aspect === aspect)
+      .flatMap((item) => item.keywords)
+      .reduce<Record<string, number>>((acc, keyword) => {
+        acc[keyword] = (acc[keyword] || 0) + 1;
+        return acc;
+      }, {});
+    return {
+      aspect,
+      keywords: Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 6),
+    };
+  });
+}
+
 function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void }) {
   const [model, setModel] = useState('全部车型');
+  const [importResult, setImportResult] = useState<ReviewImportResult | null>(null);
   const filtered = reviews.filter((item) => model === '全部车型' || item.model === model);
   const models = ['全部车型', ...Array.from(new Set(reviews.map((item) => item.model)))];
+  const insights = filtered.map(extractReviewInsight);
+  const aspectStats = aspectInsightStats(insights);
+  const sentimentCounts = countInsightsBySentiment(insights);
+  const keywordStats = keywordStatsByAspect(insights);
   const upload = async (file: File) => {
     const parsed = await parseReviewFile(file);
-    if (parsed.length) setReviews(parsed);
+    setImportResult(parsed);
+    if (parsed.reviews.length) setReviews(parsed.reviews);
+  };
+  const selectTextColumn = (column: string) => {
+    if (!importResult) return;
+    const next = rebuildReviewImportResult(importResult, column);
+    setImportResult(next);
+    setReviews(next.reviews);
   };
   return (
     <div className="grid">
       <section className="panel">
-        <h2 className="section-title">评论数据导入与方面级ABSA分析</h2>
+        <h2 className="section-title">评论数据导入与感知质量信息抽取</h2>
         <label className="upload">
           <input type="file" accept=".xlsx,.xls,.csv,.tsv" style={{ display: 'none' }} onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} />
           <div>
             <MessageSquareText className="cyan" size={34} />
             <h3>拖拽或点击导入评论表格</h3>
-            <p className="muted">支持 TSV / CSV / Excel；压缩包请先解压后上传 train.tsv、validation.tsv 或 test.tsv，系统将输出 Aspect、Opinion、Sentiment、Reason 四类信息。</p>
+            <p className="muted">支持 TSV / CSV / Excel；系统先识别评论原文，再进行方面识别、情感识别和归因关键词提取。</p>
           </div>
         </label>
       </section>
-      <div className="grid cols-3">
-        <section className="panel"><h2 className="section-title">ABSA情感分布</h2><ReactECharts className="chart-sm" option={{ tooltip: {}, series: [{ type: 'pie', radius: ['45%', '70%'], data: toPieData(reviews) }] }} /></section>
-        <section className="panel"><h2 className="section-title">方面分布</h2><ReactECharts className="chart-sm" option={{ tooltip: {}, grid: chartGrid, xAxis: { type: 'category', data: toAspectBars(reviews).map((item) => item.aspect), axisLabel: { ...chartText, rotate: 15 } }, yAxis: { type: 'value', axisLabel: chartText }, series: [{ type: 'bar', data: toAspectBars(reviews).map((item) => item.total), itemStyle: { color: '#22d3ee' } }] }} /></section>
-        <section className="panel"><h2 className="section-title">感知痛点词云</h2><div className="word-cloud">{['冬季续航', '车机卡顿', '空悬异响', '雨天误报', 'BMS策略', '快充限流'].map((word, index) => <span key={word} className={index % 2 ? 'amber' : 'cyan'} style={{ fontSize: 20 + index * 3 }}>{word}</span>)}</div></section>
-      </div>
+
       <section className="panel">
-        <h2 className="section-title">方面级ABSA结构化结果</h2>
+        <h2 className="section-title">导入状态与样本预览</h2>
+        <div className="import-grid">
+          <Kpi title="总评论数" value={reviews.length.toLocaleString()} hint={importResult?.fileName || '内置演示样本'} tone="cyan" />
+          <Kpi title="识别评论列" value={importResult?.detectedTextColumn || 'text'} hint={importResult?.needsColumnSelection ? '建议手动确认评论列' : '已自动识别'} tone={importResult?.needsColumnSelection ? 'amber' : 'green'} />
+          <Kpi title="当前筛选样本" value={filtered.length.toLocaleString()} hint={model} tone="cyan" />
+        </div>
+        {importResult?.needsColumnSelection && (
+          <div className="manual-column">
+            <span className="muted">未能高置信识别评论列，请手动选择：</span>
+            <select className="btn secondary" value={importResult.detectedTextColumn || ''} onChange={(event) => selectTextColumn(event.target.value)}>
+              <option value="">选择评论列</option>
+              {importResult.columns.map((column) => <option value={column} key={column}>{column}</option>)}
+            </select>
+          </div>
+        )}
+        <div className="sample-preview">
+          {filtered.slice(0, 3).map((item) => <p className="muted" key={item.id}>“{item.text}”</p>)}
+        </div>
+      </section>
+
+      <div className="grid cols-3">
+        <section className="panel">
+          <h2 className="section-title">情感分布</h2>
+          <div className="sentiment-cards">
+            {(['positive', 'neutral', 'negative'] as Sentiment[]).map((sentiment) => {
+              const count = sentimentCounts[sentiment];
+              const ratio = insights.length ? ((count / insights.length) * 100).toFixed(1) : '0.0';
+              return <div className="sentiment-card" key={sentiment}><span className={`tag ${sentimentTone(sentiment)}`}>{sentimentLabel(sentiment)}</span><strong>{ratio}%</strong><p className="muted">{count} 条评论</p></div>;
+            })}
+          </div>
+          <ReactECharts className="chart-xs" option={{ tooltip: {}, series: [{ type: 'pie', radius: ['48%', '72%'], data: toPieData(filtered) }] }} />
+        </section>
+        <section className="panel">
+          <h2 className="section-title">方面分布</h2>
+          <ReactECharts className="chart-sm" option={{ tooltip: {}, grid: { ...chartGrid, bottom: 72 }, xAxis: { type: 'category', data: aspectStats.map((item) => item.aspect), axisLabel: { ...chartText, rotate: 30 } }, yAxis: { type: 'value', axisLabel: chartText }, series: [{ type: 'bar', data: aspectStats.map((item) => item.count), itemStyle: { color: '#22d3ee' }, label: { show: true, position: 'top', color: '#b7c8df', formatter: (p: { dataIndex: number }) => `${aspectStats[p.dataIndex]?.ratio}%` } }] }} />
+        </section>
+        <section className="panel">
+          <h2 className="section-title">方面 × 情感矩阵</h2>
+          <div className="sentiment-matrix">
+            {aspectStats.slice(0, 8).map((item) => {
+              const total = item.count || 1;
+              return <div className="matrix-row" key={item.aspect}><strong>{item.aspect}</strong><div className="matrix-bars"><span className="green-bg" style={{ width: `${(item.positive / total) * 100}%` }} /><span className="amber-bg" style={{ width: `${(item.neutral / total) * 100}%` }} /><span className="rose-bg" style={{ width: `${(item.negative / total) * 100}%` }} /></div><span className="muted">{Math.round((item.negative / total) * 100)}%负面</span></div>;
+            })}
+          </div>
+        </section>
+      </div>
+
+      <section className="panel">
+        <h2 className="section-title">归因关键词提取</h2>
+        <div className="keyword-grid">
+          {keywordStats.map((group) => <div className="keyword-card" key={group.aspect}><h3>{group.aspect}</h3><div className="tag-wrap">{group.keywords.map(([keyword, count]) => <span className="tag" key={keyword}>{keyword} × {count}</span>)}</div></div>)}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2 className="section-title">结构化感知质量问题</h2>
         <select className="btn secondary" value={model} onChange={(event) => setModel(event.target.value)} style={{ marginBottom: 14 }}>{models.map((item) => <option key={item}>{item}</option>)}</select>
         <table className="table absa-table">
-          <thead><tr><th>Aspect（方面）</th><th>Opinion（观点）</th><th>Sentiment（情感）</th><th>Reason（原因）</th><th>原始评论</th></tr></thead>
-          <tbody>{filtered.map((item) => { const result = extractAbsa(item.text, item.sentiment); return <tr key={item.id}><td><span className="tag">{result.aspect}</span></td><td>{result.opinion}</td><td><span className={`tag ${result.sentiment === 'negative' ? 'rose' : result.sentiment === 'positive' ? 'green' : ''}`}>{sentimentLabel(result.sentiment)}</span></td><td>{result.reason}</td><td className="muted review-text-cell">{item.text}</td></tr>; })}</tbody>
+          <thead><tr><th>原始评论</th><th>识别方面</th><th>情感方向</th><th>归因关键词</th><th>归因说明</th></tr></thead>
+          <tbody>{insights.map((item) => <tr key={item.id}><td className="muted review-text-cell">{item.rawText}</td><td><span className="tag">{item.aspect}</span></td><td><span className={`tag ${sentimentTone(item.sentiment)}`}>{sentimentLabel(item.sentiment)}</span></td><td><div className="tag-wrap">{item.keywords.map((keyword) => <span className="tag" key={keyword}>{keyword}</span>)}</div></td><td>{item.reason}</td></tr>)}</tbody>
         </table>
       </section>
     </div>

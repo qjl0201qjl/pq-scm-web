@@ -1,6 +1,6 @@
 import * as XLSX from 'xlsx';
 import { inferAspectFromText, inferSentimentFromText } from './absa';
-import { ReviewRecord, Sentiment } from './types';
+import { ReviewImportResult, ReviewRecord, Sentiment } from './types';
 
 const textKeys = ['评论', '评论文本', '评论内容', '内容', 'text', 'comment', 'comment_text', 'review'];
 const modelKeys = ['车型', '车系', 'series_name', 'model', 'carModel'];
@@ -13,10 +13,10 @@ const qualityKeywordPattern = /续航|油耗|电耗|操控|动力|车机|座舱|
 const mojibakePattern = /[åæçèéäöüÂÃ¤¦§¨©«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]|�/;
 
 function decodeText(buffer: ArrayBuffer) {
-  const decoders = ['utf-8', 'gb18030', 'gbk'];
+  const decoders = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'utf-16le'];
   const decoded = decoders.map((encoding) => {
     try {
-      const text = new TextDecoder(encoding).decode(buffer);
+      const text = encoding === 'utf-8-sig' ? new TextDecoder('utf-8').decode(buffer).replace(/^\uFEFF/, '') : new TextDecoder(encoding).decode(buffer);
       const replacementCount = (text.match(/\uFFFD/g) || []).length;
       const mojibakeCount = (text.match(mojibakePattern) || []).length;
       return { text, score: replacementCount * 4 + mojibakeCount };
@@ -106,14 +106,16 @@ function textColumnScore(key: string, values: string[]) {
 function chooseTextKey(rows: Record<string, unknown>[]) {
   const keys = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
   const direct = keys.find((key) => textKeys.some((candidate) => normalizeKey(key).includes(normalizeKey(candidate))));
-  if (direct) return direct;
-  return keys
+  if (direct) return { key: direct, confident: true };
+  const best = keys
     .map((key) => ({ key, score: textColumnScore(key, rows.map((row) => String(row[key] ?? ''))) }))
-    .sort((a, b) => b.score - a.score)[0]?.key;
+    .sort((a, b) => b.score - a.score)[0];
+  return best ? { key: best.key, confident: best.score >= 160 } : { key: undefined, confident: false };
 }
 
-function rowsToReviews(rows: Record<string, unknown>[]) {
-  const textKey = chooseTextKey(rows);
+export function parseReviewRows(rows: Record<string, unknown>[], selectedTextColumn?: string) {
+  const detected = chooseTextKey(rows);
+  const textKey = selectedTextColumn || detected.key;
   return rows
     .map((row, index) => {
       const text = textKey ? String(row[textKey] ?? '') : pick(row, textKeys);
@@ -134,16 +136,34 @@ function rowsToReviews(rows: Record<string, unknown>[]) {
     .filter((item) => item.text.trim().length > 0);
 }
 
-export async function parseReviewFile(file: File): Promise<ReviewRecord[]> {
+function buildImportResult(fileName: string, rows: Record<string, unknown>[], selectedTextColumn?: string): ReviewImportResult {
+  const detected = chooseTextKey(rows);
+  const textColumn = selectedTextColumn || detected.key;
+  const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  return {
+    fileName,
+    rows,
+    columns,
+    reviews: parseReviewRows(rows, textColumn),
+    detectedTextColumn: textColumn,
+    needsColumnSelection: !selectedTextColumn && (!detected.key || !detected.confident),
+  };
+}
+
+export async function parseReviewFile(file: File): Promise<ReviewImportResult> {
   const lowerName = file.name.toLowerCase();
   if (lowerName.endsWith('.tsv') || lowerName.endsWith('.csv')) {
     const content = decodeText(await file.arrayBuffer());
-    return rowsToReviews(parseTextRows(content));
+    return buildImportResult(file.name, parseTextRows(content));
   }
 
   const buffer = await file.arrayBuffer();
   const workbook = XLSX.read(buffer, { type: 'array' });
   const first = workbook.SheetNames[0];
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[first]);
-  return rowsToReviews(rows);
+  return buildImportResult(file.name, rows);
+}
+
+export function rebuildReviewImportResult(importResult: ReviewImportResult, selectedTextColumn: string): ReviewImportResult {
+  return buildImportResult(importResult.fileName, importResult.rows, selectedTextColumn);
 }
