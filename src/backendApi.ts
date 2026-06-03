@@ -18,6 +18,12 @@ export const backendApi = {
   runPipeline(payload: { mode: string; provider: string; batch_size: number; top_n: number; generate_report?: boolean }) {
     return request<BackendState>('/api/pipeline/run', { method: 'POST', body: JSON.stringify(payload) });
   },
+  runFullAnalysis(payload: { comments: string[]; vehicle_model: string; analysis_mode: string; provider: string; top_n: number; generate_report?: boolean }) {
+    return request<FullAnalysisResult>('/api/pipeline/run-full-analysis', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  getCurrentAnalysis() {
+    return request<FullAnalysisResult>('/api/pipeline/current-analysis');
+  },
   uploadComments(file: File, textColumn?: string) {
     const form = new FormData();
     form.append('file', file);
@@ -59,6 +65,22 @@ export const backendApi = {
   },
 };
 
+export interface FullAnalysisResult {
+  analysis_id: string;
+  created_at: string;
+  vehicle_model: string;
+  stage: string;
+  failed_stage?: string;
+  error_message?: string;
+  absa_results: Array<Record<string, unknown>>;
+  issue_summary: Array<Record<string, unknown>>;
+  fda_results: Array<Record<string, unknown>>;
+  qfd_results: Array<Record<string, unknown>>;
+  supply_chain_results: Array<Record<string, unknown>>;
+  case_chain: Array<Record<string, unknown>>;
+  report_summary: Record<string, unknown>;
+}
+
 export interface BackendState {
   stage: string;
   counts: Record<string, number>;
@@ -94,6 +116,89 @@ export function mapAbsaRows(rows: Array<Record<string, unknown>>): AnalysisResul
     confidence: Number(item.confidence ?? 0.8),
     need_review: Boolean(Number(item.need_review || 0)),
     analysis_source: String(item.analysis_source || 'rule') as AnalysisResult['analysis_source'],
+  }));
+}
+
+export function mapFullAnalysisAbsa(rows: Array<Record<string, unknown>>): AnalysisResult[] {
+  return rows.map((item) => ({
+    comment_id: String(item.comment_id || ''),
+    raw_text: String(item.raw_text || ''),
+    source: 'LLM链式分析',
+    vehicle_model: String(item.vehicle_model || ''),
+    time: '',
+    aspect: String(item.aspect || '其他'),
+    opinion: String(item.opinion || ''),
+    sentiment: toSentiment(item.sentiment),
+    reason: String(item.reason || ''),
+    confidence: Number(item.confidence ?? 0.8),
+    need_review: Number(item.confidence ?? 0.8) < 0.65,
+    analysis_source: 'llm',
+  }));
+}
+
+export function mapFullAnalysisIssues(rows: Array<Record<string, unknown>>): IssueSummary[] {
+  return rows.map((item, index) => ({
+    id: String(item.issue_id || `issue-${index + 1}`),
+    name: String(item.issue_name),
+    issueType: String(item.issue_name),
+    aspect: String(item.aspect),
+    attention: Number(item.A || 0),
+    dissatisfaction: Number(item.D || 0),
+    intensity: Number(item.I || 0),
+    pi: Number(item.final_PI || 0),
+    kano: String(item.kano_type || 'One-dimensional') as IssueSummary['kano'],
+    typicalComments: Array.isArray(item.typical_comments) ? item.typical_comments.map(String) : [],
+    attribution: String(item.summary_reason || item.kano_reason || 'LLM链式分析归并得到。'),
+    count: Number(item.total_count || 0),
+    positiveRatio: Number(item.total_count) ? Number(item.positive_count || 0) / Number(item.total_count) * 100 : 0,
+    negativeRatio: Number(item.total_count) ? Number(item.negative_count || 0) / Number(item.total_count) * 100 : 0,
+    avgConfidence: Number(item.avg_confidence || 0.8),
+    fda: Number(item.fda_score || 0),
+    normalizedAttention: 0,
+    normalizedDissatisfaction: 0,
+    normalizedIntensity: 0,
+    evidenceResults: [],
+  }));
+}
+
+export function mapFullAnalysisQfd(rows: Array<Record<string, unknown>>): QfdResult[] {
+  return rows.map((item) => ({
+    issueId: String(item.issue_id || item.issue_name),
+    issueName: String(item.issue_name || ''),
+    aspect: '',
+    featureId: `ect-${item.engineering_feature}`,
+    featureName: String(item.engineering_feature),
+    baseRelation: Number(item.base_relation || 0) as QfdResult['baseRelation'],
+    keywordMatch: Number(item.keyword_match || 0),
+    confidence: Number(item.confidence_factor || 0.8),
+    piFactor: Number(item.pi_factor || 0),
+    relationScore: Number(item.relation_score || 0),
+    evidenceKeywords: Array.isArray(item.keywords) ? item.keywords.map(String) : [],
+    module: String(item.module || ''),
+    description: String(item.calculation_explanation || item.relation_reason || ''),
+  }));
+}
+
+export function mapFullAnalysisSupply(rows: Array<Record<string, unknown>>): SupplyChainResult[] {
+  return rows.map((item) => ({
+    enterpriseName: String(item.enterprise_name),
+    module: String(item.module),
+    roleType: String(item.role_type),
+    score: Number(item.collaboration_score || 0),
+    roleWeight: 1,
+    matchScore: 1,
+    relatedFeatures: [String(item.engineering_feature)],
+    collaborationMethod: String(item.collaboration_method),
+    reason: String(item.recommendation_reason),
+    profile: {
+      enterprise_name: String(item.enterprise_name),
+      module: String(item.module),
+      role_type: String(item.role_type),
+      main_products: '',
+      typical_customers: '',
+      collaboration_capability: String(item.collaboration_method),
+      notes: 'LLM链式分析候选协同主体',
+    },
   }));
 }
 

@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -74,6 +75,30 @@ class PipelineRunRequest(BaseModel):
     top_n: int = 10
     generate_report: bool = False
     report_type: str = "完整案例实证报告"
+
+
+class FullAnalysisRequest(BaseModel):
+    comments: list[str] | None = None
+    vehicle_model: str = "上传车型"
+    analysis_mode: Literal["rule", "llm", "hybrid"] = "hybrid"
+    provider: str = "deepseek"
+    top_n: int = 10
+    generate_report: bool = False
+
+
+class ClusterIssuesRequest(BaseModel):
+    analysis_id: str | None = None
+    absa_results: list[dict[str, Any]] | None = None
+
+
+class LlmQfdRequest(BaseModel):
+    analysis_id: str | None = None
+    issue_summary: list[dict[str, Any]] | None = None
+
+
+class LlmSupplyChainRequest(BaseModel):
+    analysis_id: str | None = None
+    qfd_results: list[dict[str, Any]] | None = None
 
 
 def db() -> sqlite3.Connection:
@@ -153,6 +178,16 @@ def init_db() -> None:
               value text,
               updated_at text
             );
+            create table if not exists full_analysis (
+              analysis_id text primary key,
+              created_at text,
+              updated_at text,
+              vehicle_model text,
+              stage text,
+              failed_stage text,
+              error_message text,
+              result_json text
+            );
             """
         )
 
@@ -205,6 +240,82 @@ def data_counts() -> dict[str, int]:
         "supply_chain_results": len(rows("select id from supply_chain_results")),
         "report_records": len(rows("select report_id from report_records")),
     }
+
+
+def empty_full_result(analysis_id: str, vehicle_model: str) -> dict[str, Any]:
+    return {
+        "analysis_id": analysis_id,
+        "created_at": now_text(),
+        "vehicle_model": vehicle_model,
+        "stage": "created",
+        "failed_stage": "",
+        "error_message": "",
+        "absa_results": [],
+        "issue_summary": [],
+        "fda_results": [],
+        "qfd_results": [],
+        "supply_chain_results": [],
+        "case_chain": [],
+        "report_summary": {},
+    }
+
+
+def save_full_analysis(result: dict[str, Any], stage: str | None = None, failed_stage: str = "", error_message: str = "") -> None:
+    if stage:
+        result["stage"] = stage
+    result["failed_stage"] = failed_stage
+    result["error_message"] = error_message
+    result["updated_at"] = now_text()
+    with db() as conn:
+        conn.execute(
+            "insert or replace into full_analysis values (?,?,?,?,?,?,?,?)",
+            (
+                result["analysis_id"],
+                result.get("created_at", now_text()),
+                result["updated_at"],
+                result.get("vehicle_model", ""),
+                result.get("stage", ""),
+                failed_stage,
+                error_message,
+                json.dumps(result, ensure_ascii=False),
+            ),
+        )
+    set_state("current_analysis_id", result["analysis_id"])
+    set_state("pipeline_stage", result.get("stage", ""))
+
+
+def load_full_analysis(analysis_id: str | None = None) -> dict[str, Any] | None:
+    target = analysis_id or get_state_value("current_analysis_id")
+    if not target:
+        return None
+    record = rows("select result_json from full_analysis where analysis_id=?", (target,))
+    if not record:
+        return None
+    return json.loads(record[0]["result_json"])
+
+
+async def call_llm_json(system_prompt: str, user_prompt: str, fallback: Any) -> Any:
+    api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return fallback
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "deepseek-chat",
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            match = re.search(r"\{.*\}", content, re.S)
+            return json.loads(match.group(0) if match else content)
+    except Exception:
+        return fallback
 
 
 def norm_key(key: str) -> str:
@@ -318,11 +429,205 @@ async def llm_absa(text: str, provider: str) -> dict[str, Any]:
                 "opinion": str(payload.get("opinion") or "未提取观点"),
                 "sentiment": "positive" if "正" in str(payload.get("sentiment")) else "negative" if "负" in str(payload.get("sentiment")) else "neutral",
                 "reason": str(payload.get("reason") or "模型未返回明确原因。"),
+                "quality_issue_candidate": str(payload.get("quality_issue_candidate") or payload.get("opinion") or "待归并质量问题"),
                 "confidence": confidence,
                 "need_review": bool(payload.get("need_review")) or confidence < 0.65 or aspect == "其他",
             }
     except Exception:
         return rule_absa(text)
+
+
+def candidate_issue_from_rule(text: str, aspect: str, opinion: str) -> str:
+    issue, _ = issue_for({"raw_text": text, "aspect": aspect, "opinion": opinion, "reason": ""})
+    return issue
+
+
+async def chain_absa(comments: list[str], vehicle_model: str, mode: str, provider: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for idx, text in enumerate(comments, start=1):
+        parsed = rule_absa(text) if mode == "rule" else await llm_absa(text, provider)
+        candidate = parsed.get("quality_issue_candidate") or candidate_issue_from_rule(text, parsed["aspect"], parsed["opinion"])
+        results.append({
+            "comment_id": f"c{idx}",
+            "raw_text": text,
+            "vehicle_model": vehicle_model,
+            "aspect": parsed["aspect"],
+            "opinion": parsed["opinion"],
+            "sentiment": parsed["sentiment"],
+            "reason": parsed["reason"],
+            "quality_issue_candidate": candidate,
+            "confidence": parsed["confidence"],
+        })
+    return results
+
+
+async def chain_cluster_issues(absa_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fallback_groups: dict[str, list[dict[str, Any]]] = {}
+    for item in absa_results:
+        key = item.get("quality_issue_candidate") or candidate_issue_from_rule(item["raw_text"], item["aspect"], item["opinion"])
+        fallback_groups.setdefault(key, []).append(item)
+    fallback = {
+        "issues": [
+            {
+                "issue_id": f"issue-{idx}",
+                "issue_name": issue,
+                "aspect": items[0].get("aspect", "其他"),
+                "merged_expressions": sorted({i.get("opinion", "") for i in items if i.get("opinion")}),
+                "typical_comments": [i["raw_text"] for i in items[:3]],
+                "positive_count": sum(1 for i in items if i["sentiment"] == "positive"),
+                "negative_count": sum(1 for i in items if i["sentiment"] == "negative"),
+                "total_count": len(items),
+                "summary_reason": f"由{len(items)}条评论归并得到，主要表达包括：{'、'.join(sorted({i.get('opinion', '') for i in items if i.get('opinion')}))}",
+                "avg_confidence": round(sum(float(i.get("confidence", 0.8)) for i in items) / len(items), 2),
+            }
+            for idx, (issue, items) in enumerate(fallback_groups.items(), start=1)
+        ]
+    }
+    system = "你是新能源汽车质量问题归并专家。请将用户评论中的相似抱怨合并为统一质量问题，不要机械按词频拆分。输出必须是JSON。"
+    user = f"请归并以下ABSA结果，输出issues数组，每项包含issue_id, issue_name, aspect, merged_expressions, typical_comments, positive_count, negative_count, total_count, summary_reason, avg_confidence。\n{json.dumps(absa_results, ensure_ascii=False)}"
+    payload = await call_llm_json(system, user, fallback)
+    issues = payload.get("issues", payload if isinstance(payload, list) else fallback["issues"])
+    return issues if isinstance(issues, list) else fallback["issues"]
+
+
+def compute_chain_fda(issues: list[dict[str, Any]], all_comments: int) -> list[dict[str, Any]]:
+    base: list[dict[str, Any]] = []
+    for item in issues:
+        total = max(1, int(item.get("total_count", 0)))
+        neg = int(item.get("negative_count", 0))
+        pos = int(item.get("positive_count", 0))
+        comments = " ".join(item.get("typical_comments", []))
+        A = total / max(1, all_comments) * 100
+        D = neg / total * 100
+        I = intensity(comments, "negative") * 100 if neg else 0
+        pos_ratio = pos / total * 100
+        kano = "Attractive" if pos_ratio >= 50 and D < 20 else "Must-be" if D >= 70 and pos_ratio <= 20 else "One-dimensional"
+        if item.get("aspect") in ["安全配置", "续航与能耗", "售后服务与交付", "操控与底盘"] and D >= 50:
+            kano = "Must-be"
+        base.append({**item, "A": round(A, 1), "D": round(D, 1), "I": round(I, 1), "kano_type": kano})
+    zA, zD, zI = normalize([x["A"] for x in base]), normalize([x["D"] for x in base]), normalize([x["I"] for x in base])
+    factors = {"Must-be": 1.2, "One-dimensional": 1.0, "Attractive": 0.8}
+    output = []
+    for idx, item in enumerate(base):
+        fda = (0.3 * zA[idx] + 0.5 * zD[idx] + 0.2 * zI[idx]) * 100
+        factor = factors[item["kano_type"]]
+        output.append({**item, "fda_score": round(fda, 1), "kano_factor": factor, "final_PI": round(fda * factor, 1), "kano_reason": f"基于正负样本比例和{item.get('aspect')}方面属性的辅助判断，专家可修正。"})
+    return sorted(output, key=lambda x: x["final_PI"], reverse=True)
+
+
+async def chain_llm_qfd(issue_summary: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    qfd: list[dict[str, Any]] = []
+    max_pi = max([float(i.get("final_PI", 0)) for i in issue_summary] or [1])
+    for issue in issue_summary[:top_n]:
+        fallback_features = []
+        for mapped_issue, feature, base, keywords, module in QFD_MAP:
+            if mapped_issue == issue.get("issue_name") or issue.get("aspect") in mapped_issue:
+                fallback_features.append({"feature": feature, "module": module, "base_relation": base, "relation_reason": "专家规则映射", "keywords": keywords})
+        if not fallback_features:
+            fallback_features = [{"feature": f"{issue.get('aspect')}工程参数复核", "module": issue.get("aspect", "质量管理"), "base_relation": 3, "relation_reason": "规则不足时的通用工程复核项", "keywords": [issue.get("issue_name", "")]}]
+        fallback = {"issue_name": issue.get("issue_name"), "engineering_features": fallback_features[:6]}
+        system = "你是新能源汽车质量工程专家。请根据用户感知质量问题，将用户语言转化为可供工程部门分析的工程质量特征。请严格输出JSON，不要输出责任归属。"
+        user = f"问题名称：{issue.get('issue_name')}\n方面类别：{issue.get('aspect')}\n典型评论：{issue.get('typical_comments')}\n归因总结：{issue.get('summary_reason')}\n请输出issue_name和engineering_features数组，每个feature含feature,module,base_relation,relation_reason,keywords。base_relation只能为9,3,1。"
+        payload = await call_llm_json(system, user, fallback)
+        features = payload.get("engineering_features", fallback_features)
+        comments = " ".join(issue.get("typical_comments", []))
+        for feature in features[:6]:
+            keywords = feature.get("keywords") or [feature.get("feature", "")]
+            hits = [kw for kw in keywords if kw and kw in comments]
+            keyword_match = 1.2 if len(hits) >= 2 else 1.0 if hits else 0.8
+            confidence = float(issue.get("avg_confidence", 0.8))
+            pi_factor = float(issue.get("final_PI", 0)) / max_pi if max_pi else 1
+            base_relation = int(feature.get("base_relation", 3))
+            relation_score = base_relation * keyword_match * confidence * pi_factor
+            qfd.append({
+                "issue_id": issue.get("issue_id"),
+                "issue_name": issue.get("issue_name"),
+                "engineering_feature": feature.get("feature"),
+                "module": feature.get("module"),
+                "base_relation": base_relation,
+                "keyword_match": round(keyword_match, 2),
+                "confidence_factor": confidence,
+                "pi_factor": round(pi_factor, 2),
+                "relation_score": round(relation_score, 2),
+                "calculation_explanation": f"{base_relation} × {keyword_match:.1f} × {confidence:.2f} × {pi_factor:.2f}",
+                "relation_reason": feature.get("relation_reason", ""),
+                "keywords": keywords,
+                "typical_comments": issue.get("typical_comments", []),
+            })
+    return sorted(qfd, key=lambda x: x["relation_score"], reverse=True)
+
+
+async def chain_llm_supply(qfd_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    importance: dict[str, float] = {}
+    for item in qfd_results:
+        importance[item["engineering_feature"]] = importance.get(item["engineering_feature"], 0) + float(item.get("relation_score", 0))
+    role_weight = {"主协同主体": 1.0, "协同主体": 0.7, "支持主体": 0.4}
+    for item in qfd_results[:12]:
+        module = item.get("module", "")
+        fallback_entities = [
+            {"enterprise_name": name, "role_type": role, "collaboration_method": method, "recommendation_reason": f"与{item.get('engineering_feature')}相关，可作为潜在协同企业。", "match_score": 1.0 if role == "主协同主体" else 0.7}
+            for name, role, method in ENTERPRISES.get(module, [("质量管理部门", "支持主体", "组织跨部门复核和测试闭环")])
+        ]
+        fallback = {"engineering_feature": item.get("engineering_feature"), "supply_chain_module": module, "candidate_entities": fallback_entities}
+        system = "你是新能源汽车供应链协同改进顾问。请推荐潜在协同主体和候选企业。不要判断责任归属，只能给出潜在协同对象和协同方式建议。输出JSON。"
+        user = f"工程质量特征：{item.get('engineering_feature')}\n所属模块：{module}\n关联质量问题：{item.get('issue_name')}\n典型评论：{item.get('typical_comments')}\n禁止输出责任主体、责任归属、归责对象。必须输出candidate_entities数组。"
+        payload = await call_llm_json(system, user, fallback)
+        for entity in payload.get("candidate_entities", fallback_entities)[:5]:
+            role = entity.get("role_type", "协同主体")
+            match_score = float(entity.get("match_score", 0.7))
+            score = importance.get(item["engineering_feature"], item.get("relation_score", 0)) * role_weight.get(role, 0.7) * match_score
+            output.append({
+                "enterprise_name": entity.get("enterprise_name"),
+                "module": module,
+                "role_type": role,
+                "collaboration_score": round(score, 2),
+                "related_issue": item.get("issue_name"),
+                "engineering_feature": item.get("engineering_feature"),
+                "recommendation_reason": entity.get("recommendation_reason", ""),
+                "collaboration_method": entity.get("collaboration_method", ""),
+            })
+    return sorted(output, key=lambda x: x["collaboration_score"], reverse=True)
+
+
+def build_case_chain(result: dict[str, Any]) -> list[dict[str, Any]]:
+    absa = result.get("absa_results", [])
+    issues = result.get("issue_summary", [])
+    qfd = result.get("qfd_results", [])
+    supply = result.get("supply_chain_results", [])
+    top_issue = issues[0] if issues else {}
+    related_qfd = [item for item in qfd if item.get("issue_name") == top_issue.get("issue_name")][:5]
+    related_features = {item.get("engineering_feature") for item in related_qfd}
+    related_supply = [item for item in supply if item.get("engineering_feature") in related_features][:5]
+    return [
+        {"step": "评论样本", "items": [item.get("raw_text") for item in absa[:5]]},
+        {"step": "ABSA识别", "items": absa[:5]},
+        {"step": "质量问题归并与Kano-FDA", "items": issues[:3]},
+        {"step": "QFD工程转化", "items": related_qfd or qfd[:5]},
+        {"step": "供应链协同映射", "items": related_supply or supply[:5]},
+        {"step": "报告摘要", "items": [f"围绕{top_issue.get('issue_name', '主要质量问题')}形成辅助决策建议，专家可修正。"]},
+    ]
+
+
+def build_report_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "analysis_id": result.get("analysis_id"),
+        "vehicle_model": result.get("vehicle_model"),
+        "comment_count": len(result.get("absa_results", [])),
+        "top_issues": [
+            {"issue_name": item.get("issue_name"), "final_PI": item.get("final_PI"), "kano_type": item.get("kano_type")}
+            for item in result.get("issue_summary", [])[:10]
+        ],
+        "top_engineering_features": [
+            {"engineering_feature": item.get("engineering_feature"), "relation_score": item.get("relation_score"), "module": item.get("module")}
+            for item in result.get("qfd_results", [])[:10]
+        ],
+        "top_collaboration_candidates": [
+            {"enterprise_name": item.get("enterprise_name"), "collaboration_score": item.get("collaboration_score"), "role_type": item.get("role_type")}
+            for item in result.get("supply_chain_results", [])[:10]
+        ],
+        "method_note": "LLM链式分析结果用于新能源汽车感知质量—工程特征—供应链协同辅助决策，专家可修正，不用于精确归责。",
+    }
 
 
 @app.post("/api/comments/upload")
@@ -397,6 +702,112 @@ async def run_pipeline(req: PipelineRunRequest):
     state = unified_state()
     state["generated_report"] = report
     return state
+
+
+@app.post("/api/pipeline/run-full-analysis")
+async def run_full_analysis(req: FullAnalysisRequest):
+    analysis_id = f"ana-{uuid.uuid4().hex[:10]}"
+    result = empty_full_result(analysis_id, req.vehicle_model)
+    comments = [c.strip() for c in (req.comments or []) if c.strip()]
+    if not comments:
+        comments = [item["raw_text"] for item in rows("select raw_text from comments order by comment_id")]
+    if not comments:
+        raise HTTPException(400, "No comments provided or uploaded.")
+
+    try:
+        absa = await chain_absa(comments, req.vehicle_model, req.analysis_mode, req.provider)
+        result["absa_results"] = absa
+        save_full_analysis(result, "absa_completed")
+    except Exception as exc:
+        save_full_analysis(result, "failed", "absa", str(exc))
+        return result
+
+    try:
+        issues = await chain_cluster_issues(result["absa_results"])
+        result["issue_summary"] = issues
+        save_full_analysis(result, "issue_cluster_completed")
+    except Exception as exc:
+        save_full_analysis(result, "failed", "issue_cluster", str(exc))
+        return result
+
+    try:
+        fda = compute_chain_fda(result["issue_summary"], len(comments))
+        result["fda_results"] = fda
+        result["issue_summary"] = fda
+        save_full_analysis(result, "fda_completed")
+    except Exception as exc:
+        save_full_analysis(result, "failed", "fda", str(exc))
+        return result
+
+    try:
+        qfd = await chain_llm_qfd(result["issue_summary"], req.top_n)
+        result["qfd_results"] = qfd
+        save_full_analysis(result, "qfd_completed")
+    except Exception as exc:
+        save_full_analysis(result, "failed", "qfd", str(exc))
+        return result
+
+    try:
+        supply = await chain_llm_supply(result["qfd_results"])
+        result["supply_chain_results"] = supply
+        save_full_analysis(result, "supply_chain_completed")
+    except Exception as exc:
+        save_full_analysis(result, "failed", "supply_chain", str(exc))
+        return result
+
+    result["case_chain"] = build_case_chain(result)
+    result["report_summary"] = build_report_summary(result)
+    save_full_analysis(result, "full_analysis_completed")
+    return result
+
+
+@app.get("/api/pipeline/full-analysis/{analysis_id}")
+def get_full_analysis(analysis_id: str):
+    result = load_full_analysis(analysis_id)
+    if not result:
+        raise HTTPException(404, "analysis not found")
+    return result
+
+
+@app.get("/api/pipeline/current-analysis")
+def get_current_analysis():
+    result = load_full_analysis()
+    if not result:
+        raise HTTPException(404, "analysis not found")
+    return result
+
+
+@app.post("/api/llm/cluster-issues")
+async def llm_cluster_issues(req: ClusterIssuesRequest):
+    result = load_full_analysis(req.analysis_id) if req.analysis_id else None
+    absa = req.absa_results or (result or {}).get("absa_results", [])
+    issues = await chain_cluster_issues(absa)
+    if result:
+        result["issue_summary"] = issues
+        save_full_analysis(result, "issue_cluster_completed")
+    return {"issues": issues}
+
+
+@app.post("/api/llm/qfd-generate")
+async def llm_qfd_generate(req: LlmQfdRequest):
+    result = load_full_analysis(req.analysis_id) if req.analysis_id else None
+    issues = req.issue_summary or (result or {}).get("issue_summary", [])
+    qfd = await chain_llm_qfd(issues, len(issues) or 10)
+    if result:
+        result["qfd_results"] = qfd
+        save_full_analysis(result, "qfd_completed")
+    return {"qfd_results": qfd}
+
+
+@app.post("/api/llm/supply-chain-generate")
+async def llm_supply_chain_generate(req: LlmSupplyChainRequest):
+    result = load_full_analysis(req.analysis_id) if req.analysis_id else None
+    qfd = req.qfd_results or (result or {}).get("qfd_results", [])
+    supply = await chain_llm_supply(qfd)
+    if result:
+        result["supply_chain_results"] = supply
+        save_full_analysis(result, "supply_chain_completed")
+    return {"supply_chain_results": supply}
 
 
 @app.post("/api/absa/run")
