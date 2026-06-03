@@ -9,6 +9,7 @@ import { extractReviewInsight } from './absa';
 import { reports, reviews as seedReviews, scmRecommendations, warnings } from './data';
 import { getFdaScore, getKanoCoefficient, getKanoColor, getKanoLabel, getKpis, getPriorityExplanation, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
 import { buildAnalysisResults, buildEngineeringFeatureScores, buildIssueSummary, buildQfdResults, buildSupplyChainResults, enterpriseLibrary } from './dataflow';
+import { backendApi, mapAbsaRows, mapFeatureRows, mapIssueRows, mapQfdRows, mapSupplyRows } from './backendApi';
 import { analyzeWithLlm, defaultLlmConfig, LlmProgress, makeInitialProgress, resultToInsight, ruleInsightFor, shouldUseRuleOnly } from './llmAbsa';
 import { parseReviewFile, rebuildReviewImportResult } from './upload';
 import { AbsaMode, AnalysisResult, EngineeringFeatureScore, IssueSummary, KanoCategory, LlmAbsaConfig, QfdResult, ReviewImportResult, ReviewInsight, ReviewRecord, Sentiment, SupplyChainResult } from './types';
@@ -59,12 +60,23 @@ export default function App() {
   const [selectedFeatureId, setSelectedFeatureId] = useState('');
   const [selectedEnterpriseModule, setSelectedEnterpriseModule] = useState('全部模块');
   const [customEnterprises, setCustomEnterprises] = useState<string[]>([]);
+  const [backendStatus, setBackendStatus] = useState('前端本地计算');
+  const [backendAnalysisResults, setBackendAnalysisResults] = useState<AnalysisResult[]>([]);
+  const [backendIssues, setBackendIssues] = useState<IssueSummary[]>([]);
+  const [backendQfdResults, setBackendQfdResults] = useState<QfdResult[]>([]);
+  const [backendFeatureScores, setBackendFeatureScores] = useState<EngineeringFeatureScore[]>([]);
+  const [backendSupplyResults, setBackendSupplyResults] = useState<SupplyChainResult[]>([]);
 
-  const analysisResults = useMemo(() => buildAnalysisResults(reviews, insightMap), [reviews, insightMap]);
-  const issueSummary = useMemo(() => buildIssueSummary(analysisResults), [analysisResults]);
-  const qfdResults = useMemo(() => buildQfdResults(issueSummary), [issueSummary]);
-  const featureScores = useMemo(() => buildEngineeringFeatureScores(qfdResults), [qfdResults]);
-  const supplyChainResults = useMemo(() => buildSupplyChainResults(featureScores, qfdResults), [featureScores, qfdResults]);
+  const localAnalysisResults = useMemo(() => buildAnalysisResults(reviews, insightMap), [reviews, insightMap]);
+  const analysisResults = backendAnalysisResults.length ? backendAnalysisResults : localAnalysisResults;
+  const localIssueSummary = useMemo(() => buildIssueSummary(analysisResults), [analysisResults]);
+  const issueSummary = backendIssues.length ? backendIssues : localIssueSummary;
+  const localQfdResults = useMemo(() => buildQfdResults(issueSummary), [issueSummary]);
+  const qfdResults = backendQfdResults.length ? backendQfdResults : localQfdResults;
+  const localFeatureScores = useMemo(() => buildEngineeringFeatureScores(qfdResults), [qfdResults]);
+  const featureScores = backendFeatureScores.length ? backendFeatureScores : localFeatureScores;
+  const localSupplyChainResults = useMemo(() => buildSupplyChainResults(featureScores, qfdResults), [featureScores, qfdResults]);
+  const supplyChainResults = backendSupplyResults.length ? backendSupplyResults : localSupplyChainResults;
   const selectedProblem = issueSummary.find((item) => item.id === selectedProblemId) || issueSummary[0];
   const selectedFeature = featureScores.find((item) => item.id === selectedFeatureId) || featureScores[0];
   const uniqueCollaborators = useMemo(() => new Set(supplyChainResults.map((item) => item.enterpriseName)).size || new Set(scmRecommendations.flatMap((item) => [...item.collaborators, ...item.internalTeams])).size, [supplyChainResults]);
@@ -72,14 +84,31 @@ export default function App() {
 
   const jumpToQfd = (problemId: string) => {
     setSelectedProblemId(problemId);
-    const relation = qfdResults.find((item) => item.issueId === problemId);
-    if (relation) setSelectedFeatureId(relation.featureId);
-    setActive('qfd');
+    backendApi.generateQfd(10)
+      .then((payload) => {
+        const nextQfd = mapQfdRows(payload.items);
+        const nextFeatures = mapFeatureRows(payload.feature_importance);
+        setBackendQfdResults(nextQfd);
+        setBackendFeatureScores(nextFeatures);
+        setSelectedFeatureId(nextQfd.find((item) => item.issueId === problemId)?.featureId || nextFeatures[0]?.id || '');
+        setBackendStatus('后端QFD结果');
+      })
+      .catch(() => {
+        const relation = qfdResults.find((item) => item.issueId === problemId);
+        if (relation) setSelectedFeatureId(relation.featureId);
+      })
+      .finally(() => setActive('qfd'));
   };
 
   const jumpToScm = (featureId: string) => {
     setSelectedFeatureId(featureId);
-    setActive('scm');
+    backendApi.generateSupplyChain()
+      .then((payload) => {
+        setBackendSupplyResults(mapSupplyRows(payload.items));
+        setBackendStatus('后端供应链协同结果');
+      })
+      .catch(() => undefined)
+      .finally(() => setActive('scm'));
   };
 
   return (
@@ -113,11 +142,11 @@ export default function App() {
         <main className="main">
           <motion.div key={active} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.22 }}>
             {active === 'dashboard' && <Dashboard kpis={kpis} reviews={reviews} issues={issueSummary} />}
-            {active === 'reviews' && <ReviewAnalysis reviews={reviews} setReviews={setReviews} insightMap={insightMap} setInsightMap={setInsightMap} onGenerateDiagnosis={() => { setSelectedProblemId(issueSummary[0]?.id || ''); setActive('diagnosis'); }} />}
-            {active === 'diagnosis' && <Diagnosis issues={issueSummary} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToQfd={jumpToQfd} />}
-            {active === 'qfd' && <Qfd issues={issueSummary} qfdResults={qfdResults} featureScores={featureScores} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToScm={jumpToScm} />}
-            {active === 'scm' && <Scm featureScores={featureScores} qfdResults={qfdResults} supplyChainResults={supplyChainResults} selectedFeature={selectedFeature} selectedFeatureId={selectedFeatureId} setSelectedFeatureId={setSelectedFeatureId} selectedEnterpriseModule={selectedEnterpriseModule} setSelectedEnterpriseModule={setSelectedEnterpriseModule} customEnterprises={customEnterprises} setCustomEnterprises={setCustomEnterprises} />}
-            {active === 'case' && <CaseStudy />}
+            {active === 'reviews' && <ReviewAnalysis reviews={reviews} setReviews={setReviews} insightMap={insightMap} setInsightMap={setInsightMap} setBackendAnalysisResults={setBackendAnalysisResults} setBackendIssues={setBackendIssues} setBackendStatus={setBackendStatus} backendStatus={backendStatus} onGenerateDiagnosis={() => backendApi.generateDiagnosis(10).then((payload) => { const next = mapIssueRows(payload.items); setBackendIssues(next); setSelectedProblemId(next[0]?.id || ''); setBackendStatus('后端Kano-FDA诊断结果'); setActive('diagnosis'); }).catch(() => { setSelectedProblemId(issueSummary[0]?.id || ''); setActive('diagnosis'); })} />}
+            {active === 'diagnosis' && <Diagnosis backendStatus={backendStatus} analysisCount={analysisResults.length} issues={issueSummary} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToQfd={jumpToQfd} />}
+            {active === 'qfd' && <Qfd backendStatus={backendStatus} issues={issueSummary} qfdResults={qfdResults} featureScores={featureScores} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToScm={jumpToScm} />}
+            {active === 'scm' && <Scm backendStatus={backendStatus} featureScores={featureScores} qfdResults={qfdResults} supplyChainResults={supplyChainResults} selectedFeature={selectedFeature} selectedFeatureId={selectedFeatureId} setSelectedFeatureId={setSelectedFeatureId} selectedEnterpriseModule={selectedEnterpriseModule} setSelectedEnterpriseModule={setSelectedEnterpriseModule} customEnterprises={customEnterprises} setCustomEnterprises={setCustomEnterprises} />}
+            {active === 'case' && <CaseStudy analysisResults={analysisResults} issues={issueSummary} qfdResults={qfdResults} supplyChainResults={supplyChainResults} backendStatus={backendStatus} />}
             {active === 'reports' && <ReportCenter analysisResults={analysisResults} issues={issueSummary} featureScores={featureScores} supplyChainResults={supplyChainResults} />}
           </motion.div>
         </main>
@@ -252,7 +281,7 @@ function keywordStatsByAspect(insights: ReturnType<typeof extractReviewInsight>[
   });
 }
 
-function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, onGenerateDiagnosis }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void; insightMap: Record<string, ReviewInsight>; setInsightMap: (items: Record<string, ReviewInsight> | ((prev: Record<string, ReviewInsight>) => Record<string, ReviewInsight>)) => void; onGenerateDiagnosis: () => void }) {
+function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, setBackendAnalysisResults, setBackendIssues, setBackendStatus, backendStatus, onGenerateDiagnosis }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void; insightMap: Record<string, ReviewInsight>; setInsightMap: (items: Record<string, ReviewInsight> | ((prev: Record<string, ReviewInsight>) => Record<string, ReviewInsight>)) => void; setBackendAnalysisResults: (items: AnalysisResult[]) => void; setBackendIssues: (items: IssueSummary[]) => void; setBackendStatus: (value: string) => void; backendStatus: string; onGenerateDiagnosis: () => void }) {
   const [model, setModel] = useState('全部车型');
   const [importResult, setImportResult] = useState<ReviewImportResult | null>(null);
   const [absaMode, setAbsaMode] = useState<AbsaMode>('hybrid');
@@ -268,6 +297,12 @@ function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, onGene
   const sentimentCounts = countInsightsBySentiment(insights);
   const keywordStats = keywordStatsByAspect(insights);
   const upload = async (file: File) => {
+    try {
+      const uploaded = await backendApi.uploadComments(file);
+      setBackendStatus(`后端已接收评论数据，共${uploaded.count || 0}条`);
+    } catch {
+      setBackendStatus('后端未连接，使用前端本地解析');
+    }
     const parsed = await parseReviewFile(file);
     setImportResult(parsed);
     if (parsed.reviews.length) {
@@ -283,6 +318,16 @@ function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, onGene
     setInsightMap({});
   };
   const runAnalysis = async () => {
+    try {
+      const provider = llmConfig.provider === 'DeepSeek' ? 'deepseek' : llmConfig.provider.toLowerCase();
+      const done = await backendApi.runAbsa({ mode: absaMode, provider, batch_size: llmConfig.batchSize, text_column: importResult?.detectedTextColumn });
+      const resultRows = await backendApi.getAbsaResults();
+      setBackendAnalysisResults(mapAbsaRows(resultRows.items));
+      setBackendIssues([]);
+      setBackendStatus(`后端ABSA完成：成功${done.success}条，需复核${done.need_review}条`);
+    } catch {
+      setBackendStatus('后端ABSA不可用，使用前端本地LLM/规则分析');
+    }
     const targets = reviews;
     const startTime = Date.now();
     queueControl.current = { paused: false, stopped: false, abort: new AbortController() };
@@ -336,6 +381,7 @@ function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, onGene
     <div className="grid">
       <section className="panel">
         <h2 className="section-title">评论数据导入与感知质量信息抽取</h2>
+        <p className="muted">当前数据来源：{backendStatus}，共{reviews.length}条评论。</p>
         <label className="upload">
           <input type="file" accept=".xlsx,.xls,.csv,.tsv" style={{ display: 'none' }} onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} />
           <div>
@@ -473,7 +519,7 @@ function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, onGene
   );
 }
 
-function Diagnosis({ issues, selectedProblem, setSelectedProblemId, onJumpToQfd }: { issues: IssueSummary[]; selectedProblem?: IssueSummary; setSelectedProblemId: (id: string) => void; onJumpToQfd: (id: string) => void }) {
+function Diagnosis({ backendStatus, analysisCount, issues, selectedProblem, setSelectedProblemId, onJumpToQfd }: { backendStatus: string; analysisCount: number; issues: IssueSummary[]; selectedProblem?: IssueSummary; setSelectedProblemId: (id: string) => void; onJumpToQfd: (id: string) => void }) {
   if (!selectedProblem) return <section className="panel"><h2 className="section-title">Kano-FDA 联合诊断</h2><p className="muted">请先在评论分析页生成诊断结果。</p></section>;
   const scatterSeries = kanoOrder.map((kano) => ({
     name: getKanoLabel(kano),
@@ -493,6 +539,7 @@ function Diagnosis({ issues, selectedProblem, setSelectedProblemId, onJumpToQfd 
     <div className="grid">
       <section className="panel">
         <h2 className="section-title">Kano-FDA 联合诊断方法链</h2>
+        <p className="muted">当前数据来源：{backendStatus}，共{analysisCount}条有效评论，ABSA完成{analysisCount}条。</p>
         <div className="method-chain">
           {[
             ['ABSA', '出了什么问题', '从评论中抽取方面、观点、情感与原因。'],
@@ -559,7 +606,7 @@ function Diagnosis({ issues, selectedProblem, setSelectedProblemId, onJumpToQfd 
   );
 }
 
-function Qfd({ issues, qfdResults, featureScores, selectedProblem, setSelectedProblemId, onJumpToScm }: { issues: IssueSummary[]; qfdResults: QfdResult[]; featureScores: EngineeringFeatureScore[]; selectedProblem?: IssueSummary; setSelectedProblemId: (id: string) => void; onJumpToScm: (id: string) => void }) {
+function Qfd({ backendStatus, issues, qfdResults, featureScores, selectedProblem, setSelectedProblemId, onJumpToScm }: { backendStatus: string; issues: IssueSummary[]; qfdResults: QfdResult[]; featureScores: EngineeringFeatureScore[]; selectedProblem?: IssueSummary; setSelectedProblemId: (id: string) => void; onJumpToScm: (id: string) => void }) {
   const currentProblem = selectedProblem || issues[0];
   if (!currentProblem) return <section className="panel"><h2 className="section-title">QFD工程转化</h2><p className="muted">请先在评论分析页生成诊断结果。</p></section>;
   const selectedRelations = qfdResults.filter((item) => item.issueId === currentProblem.id);
@@ -573,7 +620,7 @@ function Qfd({ issues, qfdResults, featureScores, selectedProblem, setSelectedPr
     <div className="grid">
       <section className="panel">
         <h2 className="section-title">QFD质量屋矩阵</h2>
-        <p className="muted">基于评论证据、专家规则和模型置信度的综合关联度计算：R_ij = base_relation × KeywordMatch × Confidence × PI_factor。</p>
+        <p className="muted">当前数据来源：{backendStatus}。当前基于Kano-FDA Top问题生成QFD矩阵；综合关联度 R_ij = base_relation × KeywordMatch × Confidence × PI_factor。</p>
         <table className="table"><thead><tr><th>感知质量问题</th>{visibleFeatures.map((item) => <th key={item.id}>{item.name}</th>)}</tr></thead><tbody>{issues.map((issue) => <tr key={issue.id} onClick={() => setSelectedProblemId(issue.id)}><td><strong>{issue.name}</strong><p className="muted">PI {issue.pi}</p></td>{visibleFeatures.map((feature) => { const relation = qfdResults.find((item) => item.issueId === issue.id && item.featureId === feature.id); return <td key={feature.id}>{relation ? <div><span className="tag">{relation.relationScore}</span><p className="muted">基础{relation.baseRelation}｜匹配{relation.keywordMatch}｜置信{Math.round(relation.confidence * 100)}%｜PI因子{relation.piFactor}</p></div> : <span className="muted">-</span>}</td>; })}</tr>)}</tbody></table>
       </section>
       <section className="panel">
@@ -586,7 +633,7 @@ function Qfd({ issues, qfdResults, featureScores, selectedProblem, setSelectedPr
   );
 }
 
-function Scm({ featureScores, qfdResults, supplyChainResults, selectedFeature, selectedFeatureId, setSelectedFeatureId, selectedEnterpriseModule, setSelectedEnterpriseModule, customEnterprises, setCustomEnterprises }: { featureScores: EngineeringFeatureScore[]; qfdResults: QfdResult[]; supplyChainResults: SupplyChainResult[]; selectedFeature?: EngineeringFeatureScore; selectedFeatureId: string; setSelectedFeatureId: (id: string) => void; selectedEnterpriseModule: string; setSelectedEnterpriseModule: (value: string) => void; customEnterprises: string[]; setCustomEnterprises: (items: string[] | ((prev: string[]) => string[])) => void }) {
+function Scm({ backendStatus, featureScores, qfdResults, supplyChainResults, selectedFeature, selectedFeatureId, setSelectedFeatureId, selectedEnterpriseModule, setSelectedEnterpriseModule, customEnterprises, setCustomEnterprises }: { backendStatus: string; featureScores: EngineeringFeatureScore[]; qfdResults: QfdResult[]; supplyChainResults: SupplyChainResult[]; selectedFeature?: EngineeringFeatureScore; selectedFeatureId: string; setSelectedFeatureId: (id: string) => void; selectedEnterpriseModule: string; setSelectedEnterpriseModule: (value: string) => void; customEnterprises: string[]; setCustomEnterprises: (items: string[] | ((prev: string[]) => string[])) => void }) {
   const feature = selectedFeature || featureScores[0];
   if (!feature) return <section className="panel"><h2 className="section-title">供应链协同</h2><p className="muted">请先完成评论分析和QFD工程转化。</p></section>;
   const relatedQfd = qfdResults.filter((item) => item.featureId === feature.id);
@@ -609,7 +656,7 @@ function Scm({ featureScores, qfdResults, supplyChainResults, selectedFeature, s
     <div className="grid">
       <section className="panel">
         <h2 className="section-title">供应链协同推荐链路</h2>
-        <p className="muted">质量问题 → 工程质量特征 → 供应链模块 → 候选协同主体 → 协同建议。结果用于辅助决策，专家可修正。</p>
+        <p className="muted">当前数据来源：{backendStatus}。当前基于QFD工程特征重要度生成潜在协同企业推荐，结果用于辅助决策，专家可修正。</p>
       </section>
       <div className="grid cols-2">
       <section className="panel">
@@ -629,12 +676,36 @@ function Scm({ featureScores, qfdResults, supplyChainResults, selectedFeature, s
   );
 }
 
-function CaseStudy() {
-  return <section className="panel"><h2 className="section-title">问界 M9 案例实证</h2><div className="flow-wrap">{['评论', 'ABSA', 'Kano+FDA', 'QFD', '供应链映射', '协同建议'].map((item, index) => <div className="flow-node" key={item}><span className="tag">STEP {index + 1}</span><h3>{item}</h3></div>)}</div></section>;
+function CaseStudy({ analysisResults, issues, qfdResults, supplyChainResults, backendStatus }: { analysisResults: AnalysisResult[]; issues: IssueSummary[]; qfdResults: QfdResult[]; supplyChainResults: SupplyChainResult[]; backendStatus: string }) {
+  const topIssue = issues[0];
+  const relatedQfd = topIssue ? qfdResults.filter((item) => item.issueId === topIssue.id).slice(0, 4) : qfdResults.slice(0, 4);
+  const relatedScm = supplyChainResults.filter((item) => relatedQfd.some((qfd) => item.relatedFeatures.includes(qfd.featureName))).slice(0, 4);
+  return (
+    <div className="grid">
+      <section className="panel"><h2 className="section-title">案例实证全链路穿透</h2><p className="muted">当前数据来源：{backendStatus}。页面展示评论→ABSA→Kano-FDA→QFD→供应链协同→报告摘要的论文方法链。</p></section>
+      <div className="grid cols-3">
+        <section className="panel"><h2 className="section-title">Step 1 评论样本</h2>{analysisResults.slice(0, 5).map((item) => <p className="evidence" key={item.comment_id}>“{item.raw_text}”</p>)}</section>
+        <section className="panel"><h2 className="section-title">Step 2 ABSA识别</h2>{analysisResults.slice(0, 5).map((item) => <div className="flow-node" key={item.comment_id} style={{ marginBottom: 10 }}><strong>{item.aspect}</strong><p className="muted">{item.opinion}｜{sentimentLabel(item.sentiment)}｜置信度{Math.round(item.confidence * 100)}%</p><p>{item.reason}</p></div>)}</section>
+        <section className="panel"><h2 className="section-title">Step 3 Kano-FDA诊断</h2>{topIssue ? <div className="flow-node"><strong>{topIssue.name}</strong><p className="muted">A={topIssue.attention}｜D={topIssue.dissatisfaction}｜I={topIssue.intensity}</p><p>Final PI={topIssue.pi}｜{getKanoLabel(topIssue.kano)}</p></div> : <p className="muted">暂无诊断结果。</p>}</section>
+      </div>
+      <div className="grid cols-3">
+        <section className="panel"><h2 className="section-title">Step 4 QFD工程转化</h2>{relatedQfd.map((item) => <div className="flow-node" key={`${item.issueId}-${item.featureId}`} style={{ marginBottom: 10 }}><strong>{item.featureName}</strong><p className="muted">综合关联度 {item.relationScore}｜基础关联 {item.baseRelation}</p></div>)}</section>
+        <section className="panel"><h2 className="section-title">Step 5 供应链协同映射</h2>{relatedScm.map((item) => <div className="flow-node" key={`${item.enterpriseName}-${item.module}`} style={{ marginBottom: 10 }}><strong>{item.enterpriseName}</strong><p className="muted">{item.module}｜{item.roleType}｜得分{item.score}</p><p>{item.collaborationMethod}</p></div>)}</section>
+        <section className="panel"><h2 className="section-title">Step 6 报告摘要</h2><p className="muted">围绕“{topIssue?.name || '主要质量问题'}”，系统给出QFD工程特征和潜在协同企业推荐，用于辅助决策和专家修正。</p></section>
+      </div>
+    </div>
+  );
 }
 
 function ReportCenter({ analysisResults, issues, featureScores, supplyChainResults }: { analysisResults: AnalysisResult[]; issues: IssueSummary[]; featureScores: EngineeringFeatureScore[]; supplyChainResults: SupplyChainResult[] }) {
-  const exportExcel = () => {
+  const exportExcel = async () => {
+    try {
+      const report = await backendApi.generateReport({ report_type: '完整案例实证报告', top_n: 10, output_format: 'excel' });
+      window.location.href = backendApi.downloadUrl(report.download_url);
+      return;
+    } catch {
+      // Fallback to frontend-generated workbook when backend is offline.
+    }
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ totalComments: analysisResults.length, validResults: analysisResults.filter((item) => !item.need_review).length, negativeCount: analysisResults.filter((item) => item.sentiment === 'negative').length }]), '数据概况');
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(analysisResults), 'ABSA分析结果');
@@ -651,7 +722,7 @@ function ReportCenter({ analysisResults, issues, featureScores, supplyChainResul
     `潜在协同主体：${supplyChainResults.slice(0, 8).map((item) => item.enterpriseName).join('、')}`,
     '说明：本报告使用综合关联度和候选协同主体推荐，服务论文原型和方法链条验证，不宣称绝对精确。',
   ].join('\n');
-  return <section className="panel"><h2 className="section-title">报告中心</h2>{reports.map((item) => <div className="flow-node" key={item.title} style={{ marginBottom: 12 }}><strong>{item.title}</strong><button className="btn" style={{ float: 'right' }} onClick={() => makeDownload(item.title, `${item.title}.txt`)}>导出</button><p className="muted">格式：{item.type}｜大小：{item.size}｜时间：{item.date}</p></div>)}<div className="review-toolbar"><button className="btn" onClick={exportExcel}>生成Excel诊断报告</button><button className="btn secondary" onClick={() => makeDownload(reportText, 'PQ-SCM闭环分析报告.txt')}>导出闭环说明</button></div></section>;
+  return <section className="panel"><h2 className="section-title">报告中心</h2><p className="muted">报告内容来自评论分析结果、Kano-FDA、QFD工程特征和潜在协同企业推荐，包含方法说明和局限性说明。</p>{reports.map((item) => <div className="flow-node" key={item.title} style={{ marginBottom: 12 }}><strong>{item.title}</strong><button className="btn" style={{ float: 'right' }} onClick={() => makeDownload(item.title, `${item.title}.txt`)}>导出</button><p className="muted">格式：{item.type}｜大小：{item.size}｜时间：{item.date}</p></div>)}<div className="review-toolbar"><button className="btn" onClick={exportExcel}>生成报告</button><select className="btn secondary"><option>完整案例实证报告</option><option>感知质量诊断报告</option><option>QFD工程特征转化报告</option><option>供应链协同改进建议书</option></select><button className="btn secondary" onClick={() => makeDownload(reportText, 'PQ-SCM闭环分析报告.txt')}>导出闭环说明</button></div></section>;
 }
 
 function nodeStyle(color: string) {
