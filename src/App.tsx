@@ -245,7 +245,7 @@ function keywordStatsByAspect(insights: ReturnType<typeof extractReviewInsight>[
 function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void }) {
   const [model, setModel] = useState('全部车型');
   const [importResult, setImportResult] = useState<ReviewImportResult | null>(null);
-  const [absaMode, setAbsaMode] = useState<AbsaMode>('rule');
+  const [absaMode, setAbsaMode] = useState<AbsaMode>('hybrid');
   const [llmConfig, setLlmConfig] = useState<LlmAbsaConfig>(defaultLlmConfig);
   const [llmProgress, setLlmProgress] = useState<LlmProgress>(makeInitialProgress(0));
   const [llmInsights, setLlmInsights] = useState<Record<string, ReviewInsight>>({});
@@ -290,11 +290,11 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
         if (shouldUseRuleOnly(ruleInsight, absaMode)) {
           insight = { ...ruleInsight, source: 'rule' };
         } else {
-          const result = await analyzeWithLlm(review, llmConfig, queueControl.current.abort?.signal);
+          const result = await analyzeWithLlm(review, llmConfig, queueControl.current.abort?.signal, ruleInsight.aspect);
           insight = resultToInsight(review, result, ruleInsight, absaMode === 'hybrid' ? 'hybrid' : 'llm');
         }
         nextInsights[review.id] = insight;
-        if (insight.source !== 'rule') success += 1;
+        if (insight.source !== 'rule' && !insight.needReview) success += 1;
         if (insight.needReview) needReview += 1;
       } catch {
         nextInsights[review.id] = { ...ruleInsight, needReview: true, conflict: ['LLM调用失败'], source: 'hybrid' };
@@ -395,7 +395,7 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
             <span>已分析 {llmProgress.analyzed}/{llmProgress.total || reviews.length}</span>
             <span>成功 {llmProgress.success}</span>
             <span>失败 {llmProgress.failed}</span>
-            <span>需复核 {llmProgress.needReview || insights.filter((item) => item.needReview).length}</span>
+            <span>需复核 {llmProgress.total ? llmProgress.needReview : insights.filter((item) => item.needReview).length}</span>
             <span>预计剩余 {llmProgress.etaSeconds}s</span>
           </div>
         </div>
@@ -449,7 +449,10 @@ function ReviewAnalysis({ reviews, setReviews }: { reviews: ReviewRecord[]; setR
         <select className="btn secondary" value={model} onChange={(event) => setModel(event.target.value)} style={{ marginBottom: 14 }}>{models.map((item) => <option key={item}>{item}</option>)}</select>
         <table className="table absa-table">
           <thead><tr><th>原始评论</th><th>分析来源</th><th>识别方面</th><th>观点词</th><th>情感方向</th><th>归因说明</th><th>置信度</th><th>复核</th></tr></thead>
-          <tbody>{visibleInsights.sort((a, b) => Number(b.needReview) - Number(a.needReview) || (a.confidence || 0) - (b.confidence || 0)).map((item) => <tr key={item.id}><td className="muted review-text-cell">{item.rawText}</td><td><span className="tag">{item.source || 'rule'}</span></td><td><span className="tag">{item.aspect}</span></td><td><div className="tag-wrap">{(item.keywords.length ? item.keywords : [item.opinion || '需人工复核']).map((keyword) => <span className="tag" key={keyword}>{keyword}</span>)}</div></td><td><span className={`tag ${sentimentTone(item.sentiment)}`}>{sentimentLabel(item.sentiment)}</span></td><td>{item.reason}{item.conflict?.length ? <p className="rose">冲突项：{item.conflict.join('、')}</p> : null}</td><td>{((item.confidence || 0) * 100).toFixed(0)}%</td><td>{item.needReview ? <button className="btn secondary" onClick={() => confirmInsight(item.id)}>确认</button> : <span className="tag green">已通过</span>}</td></tr>)}</tbody>
+          <tbody>{visibleInsights.sort((a, b) => Number(b.needReview) - Number(a.needReview) || (a.confidence || 0) - (b.confidence || 0)).map((item) => {
+            const opinions = item.opinion ? [item.opinion] : item.keywords;
+            return <tr key={item.id}><td className="muted review-text-cell">{item.rawText}</td><td><span className="tag">{item.source || 'rule'}</span></td><td><span className="tag">{item.aspect}</span></td><td><div className="tag-wrap">{opinions.map((keyword) => <span className="tag" key={keyword}>{keyword}</span>)}</div></td><td><span className={`tag ${sentimentTone(item.sentiment)}`}>{sentimentLabel(item.sentiment)}</span></td><td>{item.reason}{item.needReviewReason ? <p className="muted">复核原因：{item.needReviewReason}</p> : null}{item.conflict?.length ? <p className="rose">冲突项：{item.conflict.join('、')}</p> : null}</td><td>{((item.confidence || 0) * 100).toFixed(0)}%</td><td>{item.needReview ? <button className="btn secondary" onClick={() => confirmInsight(item.id)}>确认</button> : <span className="tag green">已通过</span>}</td></tr>;
+          })}</tbody>
         </table>
       </section>
     </div>

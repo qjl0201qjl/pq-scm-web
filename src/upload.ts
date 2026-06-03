@@ -2,15 +2,16 @@ import * as XLSX from 'xlsx';
 import { inferAspectFromText, inferSentimentFromText } from './absa';
 import { ReviewImportResult, ReviewRecord, Sentiment } from './types';
 
-const textKeys = ['评论', '评论文本', '评论内容', '内容', 'text', 'comment', 'comment_text', 'review'];
+const textKeys = ['text', '评论', '评论内容', 'content', 'review', '原始评论', '评论文本', 'comment_text', 'comment'];
 const modelKeys = ['车型', '车系', 'series_name', 'model', 'carModel'];
 const platformKeys = ['平台', '来源', 'source', 'platform'];
 const dateKeys = ['时间', '日期', 'date', 'created_at', 'pub_time', 'time'];
 const sentimentKeys = ['情感', '情感极性', 'label', 'sentiment'];
 const scoreKeys = ['评分', 'score', 'user_score', 'comment_score', 'star'];
-const ignoredTextKeys = ['index', 'id', 'comment_id', 'label', 'score', 'user_score', 'comment_score', 'pub_time', 'date', 'price', 'price_range'];
+const ignoredTextKeys = ['index', 'id', 'comment_id', 'label', '车型', '车系', '来源', '平台', 'model', 'source', 'platform', 'score', 'user_score', 'comment_score', 'pub_time', 'date', 'price', 'price_range'];
 const qualityKeywordPattern = /续航|油耗|电耗|操控|动力|车机|座舱|中控|空间|内饰|外观|悬架|悬挂|减震|底盘|充电|智驾|雷达|售后|配置|舒适|噪声|异响|性价比|刹车|制动|座椅|空调|发动机/;
 const mojibakePattern = /[åæçèéäöüÂÃ¤¦§¨©«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]|�/;
+const idLikePattern = /^(NEV|EV|ID|NO|ROW)?[_-]?\d{3,}$/i;
 
 function decodeText(buffer: ArrayBuffer) {
   const decoders = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'utf-16le'];
@@ -94,23 +95,32 @@ function parseTextRows(content: string) {
 function textColumnScore(key: string, values: string[]) {
   const normalizedKey = normalizeKey(key);
   if (ignoredTextKeys.some((item) => normalizedKey === normalizeKey(item) || normalizedKey.includes(normalizeKey(item)))) return -10000;
-  const keyBonus = textKeys.some((candidate) => normalizedKey.includes(normalizeKey(candidate))) ? 500 : 0;
-  const sample = values.slice(0, 80).join('');
+  const nonEmpty = values.map((value) => value.trim()).filter(Boolean);
+  const sampleValues = nonEmpty.slice(0, 80);
+  const sample = sampleValues.join('');
   const chineseCount = (sample.match(/[\u4e00-\u9fa5]/g) || []).length;
   const keywordCount = (sample.match(qualityKeywordPattern) || []).length;
   const digitCount = (sample.match(/\d/g) || []).length;
-  const avgLength = values.length ? values.slice(0, 80).reduce((sum, item) => sum + item.length, 0) / Math.min(values.length, 80) : 0;
-  return keyBonus + chineseCount * 2 + keywordCount * 30 + avgLength * 3 - digitCount * 0.4;
+  const avgLength = sampleValues.length ? sampleValues.reduce((sum, item) => sum + item.length, 0) / sampleValues.length : 0;
+  const longTextRatio = sampleValues.length ? sampleValues.filter((item) => item.length >= 8 && !idLikePattern.test(item)).length / sampleValues.length : 0;
+  const idLikeRatio = sampleValues.length ? sampleValues.filter((item) => idLikePattern.test(item)).length / sampleValues.length : 1;
+  const exactKeyBonus = textKeys.some((candidate) => normalizedKey === normalizeKey(candidate)) ? 700 : 0;
+  const partialKeyBonus = textKeys.some((candidate) => normalizedKey.includes(normalizeKey(candidate))) ? 260 : 0;
+  return exactKeyBonus + partialKeyBonus + chineseCount * 2 + keywordCount * 40 + avgLength * 4 + longTextRatio * 220 - digitCount * 0.5 - idLikeRatio * 800;
 }
 
 function chooseTextKey(rows: Record<string, unknown>[]) {
   const keys = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
-  const direct = keys.find((key) => textKeys.some((candidate) => normalizeKey(key).includes(normalizeKey(candidate))));
-  if (direct) return { key: direct, confident: true };
+  const validKeys = keys.filter((key) => !ignoredTextKeys.some((item) => normalizeKey(key) === normalizeKey(item) || normalizeKey(key).includes(normalizeKey(item))));
+  const direct = validKeys
+    .filter((key) => textKeys.some((candidate) => normalizeKey(key) === normalizeKey(candidate)))
+    .map((key) => ({ key, score: textColumnScore(key, rows.map((row) => String(row[key] ?? ''))) }))
+    .sort((a, b) => b.score - a.score)[0];
+  if (direct && direct.score >= 260) return { key: direct.key, confident: true };
   const best = keys
     .map((key) => ({ key, score: textColumnScore(key, rows.map((row) => String(row[key] ?? ''))) }))
     .sort((a, b) => b.score - a.score)[0];
-  return best ? { key: best.key, confident: best.score >= 160 } : { key: undefined, confident: false };
+  return best && best.score > 0 ? { key: best.key, confident: best.score >= 260 } : { key: undefined, confident: false };
 }
 
 export function parseReviewRows(rows: Record<string, unknown>[], selectedTextColumn?: string) {

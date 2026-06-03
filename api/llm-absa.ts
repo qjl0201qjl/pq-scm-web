@@ -4,6 +4,7 @@ interface ApiRequest {
   method?: string;
   body?: {
     commentText?: string;
+    candidateAspect?: string;
     config?: Record<string, unknown>;
   };
 }
@@ -26,7 +27,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     return;
   }
 
-  const { commentText, config } = req.body || {};
+  const { commentText, candidateAspect, config } = req.body || {};
   if (!commentText || !config) {
     res.status(400).json({ error: 'Missing commentText or config' });
     return;
@@ -41,24 +42,25 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
   const baseUrl = String(config.baseUrl || 'https://api.deepseek.com').replace(/\/$/, '');
   const model = String(config.modelName || 'deepseek-chat');
 
-  const systemPrompt = '你是新能源汽车感知质量分析助手。你的任务是对用户评论进行方面级情感分析。请严格根据评论文本判断，不要编造不存在的信息。输出必须是合法JSON。';
-  const userPrompt = `请分析以下新能源汽车用户评论，并输出方面级情感分析结果。
+  const candidateLine = candidateAspect && candidateAspect !== '综合体验' ? `\n规则ABSA候选方面：${candidateAspect}\n请结合候选方面和评论原文判断最终结果；如果候选方面与原文不符，以原文为准。\n` : '';
+  const systemPrompt = '你是新能源汽车感知质量方面级情感分析专家。你的任务是根据用户评论识别其涉及的质量方面、观点词、情感方向和归因原因。请严格依据评论内容分析，不要使用模板化解释，不要编造评论中不存在的信息。只输出合法 JSON。';
+  const userPrompt = `请对以下新能源汽车用户评论进行方面级情感分析。
 
 评论文本：
 ${commentText}
-
-分析要求：
-1. 识别评论涉及的主要方面类别。
-2. 提取对应观点词或观点短语。
+${candidateLine}
+请完成以下任务：
+1. 判断评论主要涉及哪个感知质量方面。
+2. 提取最核心的观点词或观点短语。
 3. 判断情感方向：正面、中性、负面。
-4. 用一句话说明情感归因。
+4. 用一句话说明原因，原因必须来自评论文本。
 5. 给出置信度，范围0到1。
 6. 判断是否需要人工复核。
 
-方面类别只能从以下列表中选择：
-${aspects}。
+方面类别必须从以下列表选择：
+${aspects.split('、').join('\n')}
 
-输出JSON格式如下：
+输出 JSON：
 {
   "aspect": "",
   "opinion": "",
@@ -69,9 +71,16 @@ ${aspects}。
 }
 
 判定规则：
-- 如果评论涉及多个方面，选择最主要的方面。
-- 如果情感不明确，sentiment填“中性”，confidence低于0.6，need_review为true。
-- 如果评论过短、乱码、无意义，aspect填“其他”，sentiment填“中性”，need_review为true。
+- 出现“续航、掉电、电耗、里程、BMS、热泵、低温、冬天”等，优先考虑“续航与能耗”。
+- 出现“车机、中控屏、语音、系统、OTA、卡顿、黑屏、死机”等，优先考虑“智能座舱”。
+- 出现“智驾、辅助驾驶、自动泊车、AEB、雷达、误报”等，优先考虑“智能驾驶”。
+- 出现“座椅、腰疼、悬架、风噪、胎噪、异响、NVH”等，优先考虑“舒适性与NVH”。
+- 出现“充电、快充、慢充、充电桩、兼容、中断”等，优先考虑“充电体验”。
+- 如果评论非常短但有明确情感，也必须尽量判断，不要直接归为“其他”。
+- 只有在文本乱码、无意义、完全无法判断时，才输出 aspect="其他"。
+- need_review 只有在 confidence < 0.65 或文本乱码时才为 true。
+- 不允许统一输出“缺少明确质量关键词”。
+- 不允许统一输出“该评论反映了用户体验与工程质量特征之间的潜在对应关系”。
 - 不要输出解释文字，只输出JSON。`;
 
   try {

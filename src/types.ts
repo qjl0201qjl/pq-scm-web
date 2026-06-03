@@ -26,6 +26,7 @@ export interface ReviewInsight {
   date: string;
   confidence?: number;
   needReview?: boolean;
+  needReviewReason?: string;
   source?: 'rule' | 'llm' | 'hybrid';
   conflict?: string[];
 }
@@ -63,10 +64,12 @@ export interface LlmAbsaResult {
   reason: string;
   confidence: number;
   needReview: boolean;
+  needReviewReason?: string;
   modelName: string;
   promptVersion: string;
   createdAt: string;
   error?: string;
+  rawContent?: unknown;
 }
 
 export interface QualityProblem {
