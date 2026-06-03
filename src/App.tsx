@@ -9,7 +9,7 @@ import { extractReviewInsight } from './absa';
 import { reports, reviews as seedReviews, scmRecommendations, warnings } from './data';
 import { getFdaScore, getKanoCoefficient, getKanoColor, getKanoLabel, getKpis, getPriorityExplanation, makeDownload, sentimentLabel, toAspectBars, toPieData } from './analytics';
 import { buildAnalysisResults, buildEngineeringFeatureScores, buildIssueSummary, buildQfdResults, buildSupplyChainResults, enterpriseLibrary } from './dataflow';
-import { backendApi, mapAbsaRows, mapFeatureRows, mapIssueRows, mapQfdRows, mapSupplyRows } from './backendApi';
+import { BackendState, backendApi, mapAbsaRows, mapFeatureRows, mapIssueRows, mapQfdRows, mapSupplyRows } from './backendApi';
 import { analyzeWithLlm, defaultLlmConfig, LlmProgress, makeInitialProgress, resultToInsight, ruleInsightFor, shouldUseRuleOnly } from './llmAbsa';
 import { parseReviewFile, rebuildReviewImportResult } from './upload';
 import { AbsaMode, AnalysisResult, EngineeringFeatureScore, IssueSummary, KanoCategory, LlmAbsaConfig, QfdResult, ReviewImportResult, ReviewInsight, ReviewRecord, Sentiment, SupplyChainResult } from './types';
@@ -82,16 +82,24 @@ export default function App() {
   const uniqueCollaborators = useMemo(() => new Set(supplyChainResults.map((item) => item.enterpriseName)).size || new Set(scmRecommendations.flatMap((item) => [...item.collaborators, ...item.internalTeams])).size, [supplyChainResults]);
   const kpis = useMemo(() => getKpis(reviews, issueSummary, uniqueCollaborators), [reviews, issueSummary, uniqueCollaborators]);
 
+  const applyBackendState = (state: BackendState) => {
+    setBackendAnalysisResults(mapAbsaRows(state.analysis_results || []));
+    setBackendIssues(mapIssueRows(state.issue_summary || []));
+    setBackendQfdResults(mapQfdRows(state.qfd_results || []));
+    setBackendFeatureScores(mapFeatureRows(state.engineering_feature_importance || []));
+    setBackendSupplyResults(mapSupplyRows(state.supply_chain_results || []));
+    setBackendStatus(`后端统一状态：${state.stage}，有效ABSA ${state.counts?.valid_absa_results || 0} 条`);
+  };
+
   const jumpToQfd = (problemId: string) => {
     setSelectedProblemId(problemId);
     backendApi.generateQfd(10)
-      .then((payload) => {
-        const nextQfd = mapQfdRows(payload.items);
-        const nextFeatures = mapFeatureRows(payload.feature_importance);
-        setBackendQfdResults(nextQfd);
-        setBackendFeatureScores(nextFeatures);
+      .then(async () => {
+        const state = await backendApi.getState();
+        const nextQfd = mapQfdRows(state.qfd_results || []);
+        const nextFeatures = mapFeatureRows(state.engineering_feature_importance || []);
+        applyBackendState(state);
         setSelectedFeatureId(nextQfd.find((item) => item.issueId === problemId)?.featureId || nextFeatures[0]?.id || '');
-        setBackendStatus('后端QFD结果');
       })
       .catch(() => {
         const relation = qfdResults.find((item) => item.issueId === problemId);
@@ -103,9 +111,8 @@ export default function App() {
   const jumpToScm = (featureId: string) => {
     setSelectedFeatureId(featureId);
     backendApi.generateSupplyChain()
-      .then((payload) => {
-        setBackendSupplyResults(mapSupplyRows(payload.items));
-        setBackendStatus('后端供应链协同结果');
+      .then(async () => {
+        applyBackendState(await backendApi.getState());
       })
       .catch(() => undefined)
       .finally(() => setActive('scm'));
@@ -142,7 +149,7 @@ export default function App() {
         <main className="main">
           <motion.div key={active} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.22 }}>
             {active === 'dashboard' && <Dashboard kpis={kpis} reviews={reviews} issues={issueSummary} />}
-            {active === 'reviews' && <ReviewAnalysis reviews={reviews} setReviews={setReviews} insightMap={insightMap} setInsightMap={setInsightMap} setBackendAnalysisResults={setBackendAnalysisResults} setBackendIssues={setBackendIssues} setBackendStatus={setBackendStatus} backendStatus={backendStatus} onGenerateDiagnosis={() => backendApi.generateDiagnosis(10).then((payload) => { const next = mapIssueRows(payload.items); setBackendIssues(next); setSelectedProblemId(next[0]?.id || ''); setBackendStatus('后端Kano-FDA诊断结果'); setActive('diagnosis'); }).catch(() => { setSelectedProblemId(issueSummary[0]?.id || ''); setActive('diagnosis'); })} />}
+            {active === 'reviews' && <ReviewAnalysis reviews={reviews} setReviews={setReviews} insightMap={insightMap} setInsightMap={setInsightMap} setBackendAnalysisResults={setBackendAnalysisResults} setBackendIssues={setBackendIssues} setBackendStatus={setBackendStatus} backendStatus={backendStatus} applyBackendState={applyBackendState} onGenerateDiagnosis={() => backendApi.generateDiagnosis(10).then(async () => { const state = await backendApi.getState(); applyBackendState(state); const next = mapIssueRows(state.issue_summary || []); setSelectedProblemId(next[0]?.id || ''); setActive('diagnosis'); }).catch(() => { setSelectedProblemId(issueSummary[0]?.id || ''); setActive('diagnosis'); })} />}
             {active === 'diagnosis' && <Diagnosis backendStatus={backendStatus} analysisCount={analysisResults.length} issues={issueSummary} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToQfd={jumpToQfd} />}
             {active === 'qfd' && <Qfd backendStatus={backendStatus} issues={issueSummary} qfdResults={qfdResults} featureScores={featureScores} selectedProblem={selectedProblem} setSelectedProblemId={setSelectedProblemId} onJumpToScm={jumpToScm} />}
             {active === 'scm' && <Scm backendStatus={backendStatus} featureScores={featureScores} qfdResults={qfdResults} supplyChainResults={supplyChainResults} selectedFeature={selectedFeature} selectedFeatureId={selectedFeatureId} setSelectedFeatureId={setSelectedFeatureId} selectedEnterpriseModule={selectedEnterpriseModule} setSelectedEnterpriseModule={setSelectedEnterpriseModule} customEnterprises={customEnterprises} setCustomEnterprises={setCustomEnterprises} />}
@@ -281,7 +288,7 @@ function keywordStatsByAspect(insights: ReturnType<typeof extractReviewInsight>[
   });
 }
 
-function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, setBackendAnalysisResults, setBackendIssues, setBackendStatus, backendStatus, onGenerateDiagnosis }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void; insightMap: Record<string, ReviewInsight>; setInsightMap: (items: Record<string, ReviewInsight> | ((prev: Record<string, ReviewInsight>) => Record<string, ReviewInsight>)) => void; setBackendAnalysisResults: (items: AnalysisResult[]) => void; setBackendIssues: (items: IssueSummary[]) => void; setBackendStatus: (value: string) => void; backendStatus: string; onGenerateDiagnosis: () => void }) {
+function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, setBackendAnalysisResults, setBackendIssues, setBackendStatus, backendStatus, applyBackendState, onGenerateDiagnosis }: { reviews: ReviewRecord[]; setReviews: (items: ReviewRecord[]) => void; insightMap: Record<string, ReviewInsight>; setInsightMap: (items: Record<string, ReviewInsight> | ((prev: Record<string, ReviewInsight>) => Record<string, ReviewInsight>)) => void; setBackendAnalysisResults: (items: AnalysisResult[]) => void; setBackendIssues: (items: IssueSummary[]) => void; setBackendStatus: (value: string) => void; backendStatus: string; applyBackendState: (state: BackendState) => void; onGenerateDiagnosis: () => void }) {
   const [model, setModel] = useState('全部车型');
   const [importResult, setImportResult] = useState<ReviewImportResult | null>(null);
   const [absaMode, setAbsaMode] = useState<AbsaMode>('hybrid');
@@ -321,8 +328,7 @@ function ReviewAnalysis({ reviews, setReviews, insightMap, setInsightMap, setBac
     try {
       const provider = llmConfig.provider === 'DeepSeek' ? 'deepseek' : llmConfig.provider.toLowerCase();
       const done = await backendApi.runAbsa({ mode: absaMode, provider, batch_size: llmConfig.batchSize, text_column: importResult?.detectedTextColumn });
-      const resultRows = await backendApi.getAbsaResults();
-      setBackendAnalysisResults(mapAbsaRows(resultRows.items));
+      applyBackendState(await backendApi.getState());
       setBackendIssues([]);
       setBackendStatus(`后端ABSA完成：成功${done.success}条，需复核${done.need_review}条`);
     } catch {

@@ -67,6 +67,15 @@ class ReportRequest(BaseModel):
     output_format: Literal["excel", "word", "pdf"] = "excel"
 
 
+class PipelineRunRequest(BaseModel):
+    mode: Literal["rule", "llm", "hybrid"] = "hybrid"
+    provider: str = "deepseek"
+    batch_size: int = 20
+    top_n: int = 10
+    generate_report: bool = False
+    report_type: str = "完整案例实证报告"
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -139,6 +148,11 @@ def init_db() -> None:
               created_at text,
               file_path text
             );
+            create table if not exists pipeline_state (
+              key text primary key,
+              value text,
+              updated_at text
+            );
             """
         )
 
@@ -149,6 +163,48 @@ init_db()
 def rows(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     with db() as conn:
       return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def set_state(key: str, value: Any) -> None:
+    payload = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    with db() as conn:
+        conn.execute("insert or replace into pipeline_state values (?,?,?)", (key, payload, now_text()))
+
+
+def get_state_value(key: str, default: Any = None) -> Any:
+    record = rows("select value from pipeline_state where key=?", (key,))
+    if not record:
+        return default
+    raw = record[0]["value"]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def clear_downstream(conn: sqlite3.Connection, include_absa: bool = False) -> None:
+    if include_absa:
+        conn.execute("delete from absa_results")
+    conn.execute("delete from issue_summary")
+    conn.execute("delete from qfd_results")
+    conn.execute("delete from supply_chain_results")
+
+
+def data_counts() -> dict[str, int]:
+    return {
+        "comments": len(rows("select comment_id from comments")),
+        "absa_results": len(rows("select comment_id from absa_results")),
+        "valid_absa_results": len(rows("select comment_id from absa_results where need_review=0")),
+        "need_review": len(rows("select comment_id from absa_results where need_review=1")),
+        "issue_summary": len(rows("select issue_id from issue_summary")),
+        "qfd_results": len(rows("select id from qfd_results")),
+        "supply_chain_results": len(rows("select id from supply_chain_results")),
+        "report_records": len(rows("select report_id from report_records")),
+    }
 
 
 def norm_key(key: str) -> str:
@@ -278,12 +334,14 @@ async def upload_comments(file: UploadFile = File(...), text_column: str | None 
         return {"needs_column_selection": True, "columns": list(data[0].keys()) if data else [], "detected_text_column": detected, "preview_rows": data[:5]}
     with db() as conn:
         conn.execute("delete from comments")
-        conn.execute("delete from absa_results")
+        clear_downstream(conn, include_absa=True)
         for idx, row in enumerate(data, start=1):
             raw_text = str(row.get(chosen, "")).strip()
             if not raw_text:
                 continue
             conn.execute("insert or replace into comments values (?,?,?,?,?)", (f"c{idx}", raw_text, pick(row, ["来源", "source", "platform"], "用户上传"), pick(row, ["车型", "model", "vehicle_model"], "上传车型"), pick(row, ["时间", "日期", "date", "time"], "")))
+    set_state("data_source", {"type": "uploaded_file", "file_name": file.filename, "text_column": chosen})
+    set_state("pipeline_stage", "comments_uploaded")
     return {"needs_column_selection": False, "detected_text_column": chosen, "count": len(rows("select * from comments")), "preview": rows("select * from comments limit 100")}
 
 
@@ -292,15 +350,67 @@ def comments_preview():
     return {"items": rows("select * from comments limit 100")}
 
 
+@app.get("/api/state")
+def unified_state():
+    comments = rows("select * from comments order by comment_id")
+    absa = rows("select c.*, a.* from comments c left join absa_results a using(comment_id) order by c.comment_id")
+    issues = rows("select * from issue_summary order by final_PI desc")
+    qfd = rows("select q.*, i.issue_name, i.aspect from qfd_results q left join issue_summary i using(issue_id) order by relation_score desc")
+    feature_importance = rows("select engineering_feature, module, round(sum(relation_score),2) importance from qfd_results group by engineering_feature, module order by importance desc")
+    supply_chain = rows("select * from supply_chain_results order by collaboration_score desc")
+    reports = rows("select * from report_records order by created_at desc")
+    stage = get_state_value("pipeline_stage", "empty")
+    return {
+        "stage": stage,
+        "counts": data_counts(),
+        "data_source": get_state_value("data_source", {"type": "empty"}),
+        "meta": {
+            "absa": get_state_value("absa", {}),
+            "diagnosis": get_state_value("diagnosis", {}),
+            "qfd": get_state_value("qfd", {}),
+            "supply_chain": get_state_value("supply_chain", {}),
+            "report": get_state_value("report", {}),
+        },
+        "comments": comments,
+        "analysis_results": absa,
+        "issue_summary": issues,
+        "qfd_results": qfd,
+        "engineering_feature_importance": feature_importance,
+        "supply_chain_results": supply_chain,
+        "report_records": reports,
+    }
+
+
+@app.post("/api/pipeline/run")
+async def run_pipeline(req: PipelineRunRequest):
+    comments = rows("select comment_id from comments")
+    if not comments:
+        raise HTTPException(400, "No comments uploaded. Please upload comments first.")
+    await run_absa(AbsaRunRequest(mode=req.mode, provider=req.provider, batch_size=req.batch_size))
+    generate_diagnosis(DiagnosisRequest(top_n=req.top_n))
+    generate_qfd(QfdRequest(top_n=req.top_n, allow_llm_enhance=False))
+    generate_supply_chain(SupplyChainRequest(allow_llm_enhance=False))
+    report = None
+    if req.generate_report:
+        report = generate_report(ReportRequest(report_type=req.report_type, top_n=req.top_n, output_format="excel"))
+    set_state("pipeline_stage", "full_chain_completed" if not report else "report_completed")
+    state = unified_state()
+    state["generated_report"] = report
+    return state
+
+
 @app.post("/api/absa/run")
 async def run_absa(req: AbsaRunRequest):
     comments = rows("select * from comments")
     with db() as conn:
-        conn.execute("delete from absa_results")
+        clear_downstream(conn, include_absa=True)
         for item in comments:
             result = rule_absa(item["raw_text"]) if req.mode == "rule" else await llm_absa(item["raw_text"], req.provider)
             conn.execute("insert or replace into absa_results values (?,?,?,?,?,?,?,?)", (item["comment_id"], result["aspect"], result["opinion"], result["sentiment"], result["reason"], result["confidence"], int(result["need_review"]), req.mode))
-    return {"total": len(comments), "success": len(rows("select * from absa_results where need_review=0")), "need_review": len(rows("select * from absa_results where need_review=1"))}
+    summary = {"total": len(comments), "success": len(rows("select * from absa_results where need_review=0")), "need_review": len(rows("select * from absa_results where need_review=1")), "mode": req.mode, "provider": req.provider}
+    set_state("absa", summary)
+    set_state("pipeline_stage", "absa_completed")
+    return summary
 
 
 @app.get("/api/absa/results")
@@ -377,6 +487,8 @@ def generate_diagnosis(req: DiagnosisRequest):
             pi = fda * factor
             evidence = [i["raw_text"] for i in item["items"][:3]]
             conn.execute("insert or replace into issue_summary values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (item["id"], item["issue"], item["aspect"], len(item["items"]), item["neg"], item["pos"], round(item["A"], 1), round(item["D"], 1), round(item["I"], 1), item["kano"], round(fda, 1), factor, round(pi, 1), json.dumps(evidence, ensure_ascii=False)))
+    set_state("diagnosis", {"top_n": req.top_n, "issue_count": len(base)})
+    set_state("pipeline_stage", "diagnosis_completed")
     return diagnosis_results()
 
 
@@ -420,6 +532,8 @@ def generate_qfd(req: QfdRequest):
                 score = base * keyword_match * avg_conf * pi_factor
                 explanation = f"base_relation={base}, keyword_match={keyword_match}, confidence={avg_conf:.2f}, pi_factor={pi_factor:.2f}"
                 conn.execute("insert into qfd_results (issue_id, engineering_feature, base_relation, keyword_match, confidence_factor, pi_factor, relation_score, module, explanation) values (?,?,?,?,?,?,?,?,?)", (issue["issue_id"], feature, base, keyword_match, avg_conf, pi_factor, round(score, 2), module, explanation))
+    set_state("qfd", {"top_n": req.top_n, "result_count": len(rows("select id from qfd_results")), "allow_llm_enhance": req.allow_llm_enhance})
+    set_state("pipeline_stage", "qfd_completed")
     return qfd_results()
 
 
@@ -454,6 +568,8 @@ def generate_supply_chain(req: SupplyChainRequest):
                 score = feature["importance"] * role_weight.get(role, 0.7)
                 reason = f"基于QFD工程特征“{feature['engineering_feature']}”的重要度{feature['importance']:.2f}生成的候选协同主体推荐。"
                 conn.execute("insert into supply_chain_results (engineering_feature, module, enterprise_name, role_type, collaboration_score, collaboration_method, recommendation_reason, model_suggested) values (?,?,?,?,?,?,?,0)", (feature["engineering_feature"], feature["module"], enterprise, role, round(score, 2), method, reason))
+    set_state("supply_chain", {"result_count": len(rows("select id from supply_chain_results")), "allow_llm_enhance": req.allow_llm_enhance})
+    set_state("pipeline_stage", "supply_chain_completed")
     return supply_chain_results()
 
 
@@ -500,6 +616,8 @@ def generate_report(req: ReportRequest):
         path.write_text(json.dumps(case_full_chain(), ensure_ascii=False, indent=2), encoding="utf-8")
     with db() as conn:
         conn.execute("insert or replace into report_records values (?,?,?,?)", (report_id, req.report_type, time.strftime("%Y-%m-%d %H:%M:%S"), str(path)))
+    set_state("report", {"report_id": report_id, "report_type": req.report_type, "file_path": str(path)})
+    set_state("pipeline_stage", "report_completed")
     return {"report_id": report_id, "download_url": f"/api/reports/download/{report_id}", "file_path": str(path)}
 
 

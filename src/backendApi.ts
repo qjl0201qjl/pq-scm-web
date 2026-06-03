@@ -12,6 +12,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const backendApi = {
+  getState() {
+    return request<BackendState>('/api/state');
+  },
+  runPipeline(payload: { mode: string; provider: string; batch_size: number; top_n: number; generate_report?: boolean }) {
+    return request<BackendState>('/api/pipeline/run', { method: 'POST', body: JSON.stringify(payload) });
+  },
   uploadComments(file: File, textColumn?: string) {
     const form = new FormData();
     form.append('file', file);
@@ -52,6 +58,20 @@ export const backendApi = {
     return `${API_BASE}${path}`;
   },
 };
+
+export interface BackendState {
+  stage: string;
+  counts: Record<string, number>;
+  data_source: Record<string, unknown>;
+  meta: Record<string, unknown>;
+  comments: Array<Record<string, unknown>>;
+  analysis_results: Array<Record<string, unknown>>;
+  issue_summary: Array<Record<string, unknown>>;
+  qfd_results: Array<Record<string, unknown>>;
+  engineering_feature_importance: Array<Record<string, unknown>>;
+  supply_chain_results: Array<Record<string, unknown>>;
+  report_records: Array<Record<string, unknown>>;
+}
 
 function toSentiment(value: unknown): Sentiment {
   const raw = String(value || '');
