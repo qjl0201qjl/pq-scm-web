@@ -109,3 +109,75 @@ export interface ScmRecommendation {
   urgency: '高' | '中' | '低';
   cost: '高' | '中' | '低';
 }
+
+export interface AnalysisResult {
+  comment_id: string;
+  raw_text: string;
+  source: string;
+  vehicle_model: string;
+  time: string;
+  aspect: string;
+  opinion: string;
+  sentiment: Sentiment;
+  reason: string;
+  confidence: number;
+  need_review: boolean;
+  analysis_source: 'rule' | 'llm' | 'hybrid';
+}
+
+export interface IssueSummary extends QualityProblem {
+  issueType: string;
+  count: number;
+  positiveRatio: number;
+  negativeRatio: number;
+  avgConfidence: number;
+  fda: number;
+  normalizedAttention: number;
+  normalizedDissatisfaction: number;
+  normalizedIntensity: number;
+  evidenceResults: AnalysisResult[];
+}
+
+export interface EngineeringFeatureScore extends EngineeringFeature {
+  score: number;
+  relatedIssues: string[];
+}
+
+export interface QfdResult {
+  issueId: string;
+  issueName: string;
+  aspect: string;
+  featureId: string;
+  featureName: string;
+  baseRelation: 0 | 1 | 3 | 9;
+  keywordMatch: number;
+  confidence: number;
+  piFactor: number;
+  relationScore: number;
+  evidenceKeywords: string[];
+  module: string;
+  description: string;
+}
+
+export interface EnterpriseProfile {
+  enterprise_name: string;
+  module: string;
+  role_type: string;
+  main_products: string;
+  typical_customers: string;
+  collaboration_capability: string;
+  notes: string;
+}
+
+export interface SupplyChainResult {
+  enterpriseName: string;
+  module: string;
+  roleType: string;
+  score: number;
+  roleWeight: number;
+  matchScore: number;
+  relatedFeatures: string[];
+  collaborationMethod: string;
+  reason: string;
+  profile: EnterpriseProfile;
+}
